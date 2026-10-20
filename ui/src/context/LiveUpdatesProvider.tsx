@@ -860,6 +860,11 @@ const ISSUE_DOCUMENT_ACTIVITY_ACTIONS = new Set([
   "issue.document_restored",
   "issue.document_deleted",
 ]);
+const ISSUE_CASE_WORK_ACTIVITY_ACTIONS = new Set([
+  "issue.updated",
+  "issue.checked_out",
+  "issue.released",
+]);
 const ISSUE_DOCUMENT_ANNOTATION_ACTIVITY_ACTIONS = new Set([
   "issue.document_annotation_thread_created",
   "issue.document_annotation_comment_added",
@@ -1372,17 +1377,24 @@ function invalidateActivityQueries(
         entityId,
         details,
       );
-      if (action && ISSUE_DOCUMENT_ACTIVITY_ACTIONS.has(action)) {
+      const taskDocumentsChanged = !!action && ISSUE_DOCUMENT_ACTIVITY_ACTIONS.has(action);
+      const caseWorkChanged = !!action && ISSUE_CASE_WORK_ACTIVITY_ACTIONS.has(action);
+      if (caseWorkChanged) {
+        // A changed task can bring a case into a filtered list that did not
+        // contain it, even when no case detail has been loaded yet.
+        queryClient.invalidateQueries({ queryKey: queryKeys.cases.list(companyId) });
+      }
+      if (taskDocumentsChanged || caseWorkChanged) {
         const changedTaskRefs = new Set(issueRefs);
-        // Case detail rolls up task documents, including tasks with no documents
-        // yet. Refresh by the relationship so creation/deletion is covered too.
+        // Both detail aliases embed primary-task state. Linked tasks affect the
+        // document rollup, including creation of their first document.
         queryClient.invalidateQueries({
           queryKey: ["cases", "detail"],
           predicate: (query) => {
             const cached = query.state.data as CaseDetail | undefined;
             return cached?.companyId === companyId && (
               changedTaskRefs.has(cached.workIssueId ?? "") ||
-              cached.issueLinks?.some((link) => changedTaskRefs.has(link.issueId)) === true
+              (taskDocumentsChanged && cached.issueLinks?.some((link) => changedTaskRefs.has(link.issueId)) === true)
             );
           },
         });

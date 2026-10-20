@@ -534,6 +534,111 @@ describe("LiveUpdatesProvider issue invalidation", () => {
     }
   });
 
+  it.each([
+    { label: "checkout", action: "issue.checked_out", status: "in_progress", assigneeAgentId: "agent-1" },
+    { label: "completion without a handoff", action: "issue.updated", status: "done", assigneeAgentId: "agent-1" },
+    { label: "reassignment without a handoff", action: "issue.updated", status: "todo", assigneeAgentId: "agent-2" },
+    { label: "release", action: "issue.released", status: "todo", assigneeAgentId: null },
+  ])("refreshes case work after primary task $label", async ({ action, status, assigneeAgentId }) => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: Infinity } } });
+    const initial = {
+      id: "case-1", companyId: "company-1", identifier: "PAP-C1", status: "in_progress",
+      workIssueId: "issue-1", issueLinks: [],
+      workIssue: { id: "issue-1", status: "todo", assigneeAgentId: "agent-1" },
+    };
+    const refreshed = { ...initial, workIssue: { ...initial.workIssue, status, assigneeAgentId } };
+    const uuidKey = queryKeys.cases.detail("case-1");
+    const identifierKey = queryKeys.cases.detail("PAP-C1");
+    const listKey = [...queryKeys.cases.list("company-1"), { q: "receipt" }];
+    const excludedKeys = [
+      queryKeys.cases.detail("PAP-C2"),
+      queryKeys.cases.detail("PAP-C3"),
+      queryKeys.cases.detail("OTHER-C1"),
+      queryKeys.cases.list("company-2"),
+    ];
+    client.setQueryData(uuidKey, initial);
+    client.setQueryData(identifierKey, initial);
+    client.setQueryData(listKey, [initial]);
+    client.setQueryData(excludedKeys[0], { ...initial, workIssueId: "another-primary", issueLinks: [{ issueId: "issue-1" }] });
+    client.setQueryData(excludedKeys[1], { ...initial, workIssueId: null });
+    client.setQueryData(excludedKeys[2], { ...initial, companyId: "company-2" });
+    client.setQueryData(excludedKeys[3], [initial]);
+    const readCase = vi.fn(async () => refreshed);
+    const readList = vi.fn(async () => [refreshed]);
+    const detailObserver = new QueryObserver(client, { queryKey: identifierKey, queryFn: readCase });
+    const listObserver = new QueryObserver(client, { queryKey: listKey, queryFn: readList });
+    const unsubscribeDetail = detailObserver.subscribe(() => {});
+    const unsubscribeList = listObserver.subscribe(() => {});
+    try {
+      expect(readCase).not.toHaveBeenCalled();
+      expect(readList).not.toHaveBeenCalled();
+
+      __liveUpdatesTestUtils.invalidateActivityQueries(client, "company-1", {
+        entityType: "issue", entityId: "issue-1", action,
+        actorType: "agent", actorId: "agent-1", details: { status, assigneeAgentId },
+      }, { userId: "user-1", agentId: null }, { pathname: "/PAP/cases/PAP-C1", isForegrounded: true });
+
+      await vi.waitFor(() => {
+        expect(readCase).toHaveBeenCalledOnce();
+        expect(readList).toHaveBeenCalledOnce();
+        expect(detailObserver.getCurrentResult().data?.workIssue).toEqual(refreshed.workIssue);
+        expect(listObserver.getCurrentResult().data).toEqual([refreshed]);
+      });
+      expect(detailObserver.getCurrentResult().data?.status).toBe("in_progress");
+      expect(client.getQueryState(uuidKey)?.isInvalidated).toBe(true);
+      for (const key of excludedKeys) expect(client.getQueryState(key)?.isInvalidated).toBe(false);
+    } finally {
+      unsubscribeDetail();
+      unsubscribeList();
+      client.clear();
+    }
+  });
+
+  it("refreshes an empty filtered case list after task changes without a cached case detail", async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: Infinity } } });
+    const listKey = [...queryKeys.cases.list("company-1"), { q: "receipt" }];
+    const otherCompanyKey = [...queryKeys.cases.list("company-2"), { q: "receipt" }];
+    const refreshed = [{ id: "case-1", companyId: "company-1", workIssueId: "issue-1" }];
+    client.setQueryData(listKey, []);
+    client.setQueryData(otherCompanyKey, []);
+    const readList = vi.fn(async () => refreshed);
+    const observer = new QueryObserver(client, { queryKey: listKey, queryFn: readList });
+    const unsubscribe = observer.subscribe(() => {});
+    try {
+      expect(readList).not.toHaveBeenCalled();
+      expect(client.getQueriesData({ queryKey: ["cases", "detail"] })).toEqual([]);
+
+      __liveUpdatesTestUtils.invalidateActivityQueries(client, "company-1", {
+        entityType: "issue", entityId: "issue-1", action: "issue.updated",
+        actorType: "agent", actorId: "agent-1", details: { assigneeAgentId: "agent-2" },
+      }, { userId: "user-1", agentId: null });
+
+      await vi.waitFor(() => expect(observer.getCurrentResult().data).toEqual(refreshed));
+      expect(readList).toHaveBeenCalledOnce();
+      expect(client.getQueryState(otherCompanyKey)?.isInvalidated).toBe(false);
+    } finally {
+      unsubscribe();
+      client.clear();
+    }
+  });
+
+  it.each(["issue.comment_added", "issue.read_marked"])("does not refresh case work for %s", (action) => {
+    const client = new QueryClient();
+    const detailKey = queryKeys.cases.detail("case-1");
+    const listKey = queryKeys.cases.list("company-1");
+    const caseData = { id: "case-1", companyId: "company-1", workIssueId: "issue-1" };
+    client.setQueryData(detailKey, caseData);
+    client.setQueryData(listKey, [caseData]);
+
+    __liveUpdatesTestUtils.invalidateActivityQueries(client, "company-1", {
+      entityType: "issue", entityId: "issue-1", action, actorType: "agent", actorId: "agent-1",
+    }, { userId: "user-1", agentId: null });
+
+    expect(client.getQueryState(detailKey)?.isInvalidated).toBe(false);
+    expect(client.getQueryState(listKey)?.isInvalidated).toBe(false);
+    client.clear();
+  });
+
   it("refreshes document annotation caches when annotation activity arrives", () => {
     const invalidations: unknown[] = [];
     const queryClient = {
