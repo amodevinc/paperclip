@@ -75,7 +75,10 @@ for (const classic of [false, true]) {
       await expect(page.getByText(task.title, { exact: true }).first()).toBeVisible();
       const statusLabel = status[0].toUpperCase() + status.slice(1);
       await expect(page.getByTestId("issue-detail-header").getByRole("button", {
-        name: `Change status (current: ${statusLabel})`, exact: true,
+        name: status === "blocked"
+          ? /^Change status \(current: Blocked(?: · [^)]*)?\)$/
+          : `Change status (current: ${statusLabel})`,
+        exact: true,
       }).first()).toBeVisible();
       // Wait for the actual agent-backed controls and thread to render before
       // asserting absence; a title alone can appear before the agent map loads.
@@ -100,7 +103,12 @@ for (const classic of [false, true]) {
     // task can legitimately be escalated to Blocked by recovery before the UI
     // observes it; that recovery behavior has separate database coverage.
     for (const status of ["blocked", "cancelled", "blocked", "done"]) {
-      await json(await request.patch(`/api/issues/${task.id}`, { data: { status } }));
+      await json(await request.patch(`/api/issues/${task.id}`, { data: {
+        status,
+        ...(status === "blocked" ? {
+          unblockDescriptor: { owner: "board", action: "Decide whether to resume the paused assignee." },
+        } : {}),
+      } }));
       await page.reload();
       await observe(status, status === "blocked");
       if (status === "cancelled" || (status === "blocked" && states.length === 2)) {
