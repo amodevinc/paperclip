@@ -28,6 +28,13 @@ test.afterEach(async ({ request }, testInfo) => {
 
 test("browses passive cases and rolled-up task documents without starting work or editing", async ({ page }, testInfo) => {
   page.setDefaultTimeout(10_000);
+  // Announcements can arrive after navigation and cover otherwise valid links.
+  // Dismiss through the ordinary Board control, including after reloads.
+  await page.addLocatorHandler(
+    page.getByRole("complementary", { name: "Paperclip announcements", exact: true })
+      .getByRole("button", { name: "Dismiss announcement", exact: true }),
+    async (dismiss) => { await dismiss.click(); },
+  );
   const api = page.request;
   const original = await json(await api.get("/api/instance/settings/experimental"));
   const company = await json(await api.post("/api/companies", { data: { name: `Read-only cases ${randomUUID()}` } }));

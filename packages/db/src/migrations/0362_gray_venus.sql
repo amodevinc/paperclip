@@ -49,7 +49,7 @@ CREATE TABLE "case_handoffs" (
 	CONSTRAINT "case_handoffs_actor_type_check" CHECK ("case_handoffs"."actor_type" in ('agent', 'user', 'system'))
 );
 
-ALTER TABLE "case_events" DROP CONSTRAINT "case_events_kind_check";
+ALTER TABLE "case_events" DROP CONSTRAINT IF EXISTS "case_events_kind_check";
 ALTER TABLE "cases" ADD COLUMN "work_issue_id" uuid;
 ALTER TABLE "cases" ADD COLUMN "phase" text;
 ALTER TABLE "cases" ADD COLUMN "handoff_version" integer DEFAULT 0 NOT NULL;
