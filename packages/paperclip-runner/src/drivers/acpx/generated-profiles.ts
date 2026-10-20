@@ -49,7 +49,6 @@ export const QUALIFIED_ACPX_PROFILE_DATA = {
     "acpxVersion": "0.13.1",
     "agent": "copilot",
     "agentProfileVersion": 48,
-    "qualificationStatus": "pending",
     "agentServerPackage": "@github/copilot",
     "agentServerVersion": "1.0.88",
     "agentRuntimePackage": null,

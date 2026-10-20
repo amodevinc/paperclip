@@ -33,7 +33,6 @@
     },
     "copilot": {
       "agentProfileVersion": 48,
-      "qualificationStatus": "pending",
       "agentServerPackage": "@github/copilot",
       "agentServerVersion": "1.0.88",
       "agentRuntimePackage": null,

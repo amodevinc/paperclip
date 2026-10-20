@@ -85,9 +85,10 @@ async function withCopilotTestPlatform<T>(arch: "x64" | "arm64", run: () => Prom
 vi.mock("./installation-integrity.js", () => ({ verifyNativeAcpxInstallation: vi.fn() }));
 
 describe("Copilot build-owned installation", () => {
-  it("keeps the case-contract candidate pending compatibility revalidation", () => {
+  it("admits profile48 after bounded case-contract compatibility revalidation", () => {
     expect(QUALIFIED_ACPX_PROFILES.copilot.agentProfileVersion).toBe(48);
-    expect(QUALIFIED_ACPX_PROFILES.copilot.qualificationStatus).toBe("pending");
+    expect(QUALIFIED_ACPX_PROFILES.copilot.qualificationStatus).toBeUndefined();
+    expect(QUALIFIED_ACPX_PROFILES.copilot.commandDigest).toBe("sha256:49171cb881c43270e101a790a109752642870daedc38cd6e91aef08fd7aab038");
   });
 
   it("preserves qualified v47 while binding the additive case contracts in v48", async () => {
