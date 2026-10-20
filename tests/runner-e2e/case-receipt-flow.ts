@@ -262,7 +262,7 @@ Use observed case/task versions, persist findings before each handoff, and obey 
   }
 }
 
-async function verifyReceiptBrowser(input: Input, workflowCase: Row, task: Row, receipt: Row) {
+export async function verifyReceiptBrowser(input: Pick<Input, "page" | "fixtures" | "execution" | "nonce" | "capture">, workflowCase: Row, task: Row, receipt: Row) {
   const { page, fixtures, nonce, execution } = input;
   const prefix = fixtures.company.issuePrefix!;
   await page.goto(`/${prefix}/cases`);
@@ -291,7 +291,7 @@ async function verifyReceiptBrowser(input: Input, workflowCase: Row, task: Row, 
   await expect(work.getByRole("link")).toHaveAttribute("href", `/${prefix}/issues/${task.identifier}`);
   const history = page.getByRole("region", { name: "Case handoffs" });
   await expect(history.locator(":scope > ol > li")).toHaveCount(5);
-  await expect(history.locator("summary").filter({ has: page.getByText("Done", { exact: true }) })).toHaveCount(1);
+  await expect(history.locator("summary").filter({ hasText: /^Done/ })).toHaveCount(1);
   await history.locator("summary").filter({ has: page.getByText("verification", { exact: true }) }).click();
   await expect(history).toContainText("currency");
   await input.capture("case-final", "Same task after the reviewer requested a correction", "case-final.png");
