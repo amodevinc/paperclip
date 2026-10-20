@@ -85,9 +85,9 @@ async function withCopilotTestPlatform<T>(arch: "x64" | "arm64", run: () => Prom
 vi.mock("./installation-integrity.js", () => ({ verifyNativeAcpxInstallation: vi.fn() }));
 
 describe("Copilot build-owned installation", () => {
-  it("holds profile49 for bounded completion-recovery compatibility revalidation", () => {
+  it("admits profile49 after bounded completion-recovery compatibility revalidation", () => {
     expect(QUALIFIED_ACPX_PROFILES.copilot.agentProfileVersion).toBe(49);
-    expect(QUALIFIED_ACPX_PROFILES.copilot.qualificationStatus).toBe("pending");
+    expect(QUALIFIED_ACPX_PROFILES.copilot.qualificationStatus).toBeUndefined();
     expect(QUALIFIED_ACPX_PROFILES.copilot.commandDigest).toBe("sha256:37a8f6a540a7417bb12becbf283158df8cca925c5136ecc0db14597441fff702");
   });
 
