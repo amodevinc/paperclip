@@ -33,7 +33,7 @@ import type {
 import type { RunForIssue } from "../api/activity";
 import type { ActiveRunForIssue, LiveRunForIssue } from "../api/heartbeats";
 import type { CompanyUserDirectoryResponse } from "../api/access";
-import type { IssueCaseLink } from "../api/cases";
+import type { CaseDetail, IssueCaseLink } from "../api/cases";
 import { issuesApi } from "../api/issues";
 import { authApi } from "../api/auth";
 import type { CompanyListResult } from "../api/companies-query";
@@ -1372,6 +1372,21 @@ function invalidateActivityQueries(
         entityId,
         details,
       );
+      if (action && ISSUE_DOCUMENT_ACTIVITY_ACTIONS.has(action)) {
+        const changedTaskRefs = new Set(issueRefs);
+        // Case detail rolls up task documents, including tasks with no documents
+        // yet. Refresh by the relationship so creation/deletion is covered too.
+        queryClient.invalidateQueries({
+          queryKey: ["cases", "detail"],
+          predicate: (query) => {
+            const cached = query.state.data as CaseDetail | undefined;
+            return cached?.companyId === companyId && (
+              changedTaskRefs.has(cached.workIssueId ?? "") ||
+              cached.issueLinks?.some((link) => changedTaskRefs.has(link.issueId)) === true
+            );
+          },
+        });
+      }
       const visibleContext = options?.pathname
         ? resolveVisibleIssueRouteContext(queryClient, options.pathname, {
             isForegrounded: options.isForegrounded,

@@ -11,7 +11,7 @@ vi.mock("../api/issues", () => ({
 }));
 
 import { describe, expect, it, vi } from "vitest";
-import { QueryClient } from "@tanstack/react-query";
+import { QueryClient, QueryObserver } from "@tanstack/react-query";
 import { __liveUpdatesTestUtils } from "./LiveUpdatesProvider";
 import { queryKeys } from "../lib/queryKeys";
 
@@ -490,6 +490,48 @@ describe("LiveUpdatesProvider issue invalidation", () => {
     expect(invalidations).toContainEqual({
       queryKey: ["issues", "document-annotations", "issue-1"],
     });
+  });
+
+  it.each(["primary", "linked"].flatMap(relationship =>
+    ["created", "updated", "restored", "deleted"].map(change => ({ relationship, change })),
+  ))("refreshes an open case document rollup for a $relationship task document $change", async ({ relationship, change }) => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: Infinity } } });
+    const document = { taskId: "issue-1", key: "findings", document: { title: "Original findings", latestRevisionNumber: 1 } };
+    const initial = {
+      id: "case-1", companyId: "company-1", identifier: "PAP-C1",
+      workIssueId: relationship === "primary" ? "issue-1" : "another-primary",
+      issueLinks: relationship === "linked" ? [{ issueId: "issue-1" }] : [],
+      taskDocuments: change === "created" || change === "restored" ? [] : [document],
+    };
+    const refreshed = { ...initial, taskDocuments: change === "deleted" ? []
+      : [{ ...document, document: { title: "Current findings", latestRevisionNumber: 2 } }] };
+    const unrelatedKey = queryKeys.cases.detail("PAP-C2");
+    const otherCompanyKey = queryKeys.cases.detail("OTHER-C1");
+    client.setQueryData(queryKeys.cases.detail("case-1"), initial);
+    client.setQueryData(queryKeys.cases.detail("PAP-C1"), initial);
+    client.setQueryData(unrelatedKey, { ...initial, id: "case-2", identifier: "PAP-C2", workIssueId: "unrelated", issueLinks: [] });
+    client.setQueryData(otherCompanyKey, { ...initial, companyId: "company-2" });
+    const readCase = vi.fn(async () => refreshed);
+    const observer = new QueryObserver(client, { queryKey: queryKeys.cases.detail("PAP-C1"), queryFn: readCase });
+    const unsubscribe = observer.subscribe(() => {});
+    try {
+      expect(observer.getCurrentResult().data?.taskDocuments).toEqual(initial.taskDocuments);
+      expect(readCase).not.toHaveBeenCalled();
+
+      __liveUpdatesTestUtils.invalidateActivityQueries(client, "company-1", {
+        entityType: "issue", entityId: "issue-1", action: `issue.document_${change}`,
+        actorType: "agent", actorId: "agent-1", details: { key: "findings" },
+      }, { userId: "user-1", agentId: null }, { pathname: "/PAP/cases/PAP-C1", isForegrounded: true });
+
+      await vi.waitFor(() => expect(observer.getCurrentResult().data?.taskDocuments).toEqual(refreshed.taskDocuments));
+      expect(readCase).toHaveBeenCalledOnce();
+      expect(client.getQueryState(queryKeys.cases.detail("case-1"))?.isInvalidated).toBe(true);
+      expect(client.getQueryState(unrelatedKey)?.isInvalidated).toBe(false);
+      expect(client.getQueryState(otherCompanyKey)?.isInvalidated).toBe(false);
+    } finally {
+      unsubscribe();
+      client.clear();
+    }
   });
 
   it("refreshes document annotation caches when annotation activity arrives", () => {
