@@ -96,11 +96,14 @@ for (const classic of [false, true]) {
     await observe("done", false);
     await capture("completed-task-paused-agent");
 
-    for (const status of ["todo", "cancelled", "todo", "done"]) {
+    // Blocked is an explicit nonterminal disposition. A paused agent's Todo
+    // task can legitimately be escalated to Blocked by recovery before the UI
+    // observes it; that recovery behavior has separate database coverage.
+    for (const status of ["blocked", "cancelled", "blocked", "done"]) {
       await json(await request.patch(`/api/issues/${task.id}`, { data: { status } }));
       await page.reload();
-      await observe(status, status === "todo");
-      if (status === "cancelled" || (status === "todo" && states.length === 2)) {
+      await observe(status, status === "blocked");
+      if (status === "cancelled" || (status === "blocked" && states.length === 2)) {
         await capture(`${status}-task-paused-agent`);
       }
     }
