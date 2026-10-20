@@ -28,6 +28,12 @@ The ledger states distinguish release waiting, assignment applied but admission
 pending, queue acceptance, and cancellation. Provider execution remains in the
 ordinary heartbeat tables.
 
+`actor_context` retains a versioned, server-derived authorization context for
+delayed assignment. It contains no credentials and is omitted from public
+handoff responses. Applying a delayed transfer rechecks the original caller's
+current assignment permissions. Historical pending transfers without this
+context fail closed; an operator can cancel them and request a new handoff.
+
 Terminal handoffs have `destination_kind = 'done'`, a null destination agent,
 and states `awaiting_completion` / `completed` with `completed_at`. They share
 pending task/case uniqueness with agent transfers but do not enter the delivery

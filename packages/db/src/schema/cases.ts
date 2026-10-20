@@ -205,6 +205,7 @@ export const caseHandoffs = pgTable("case_handoffs", {
   commentId: uuid("comment_id"),
   actorType: text("actor_type").$type<"agent" | "user" | "system">().notNull(),
   actorId: text("actor_id").notNull(),
+  actorContext: jsonb("actor_context").$type<Record<string, unknown> | null>(),
   sourceRunId: uuid("source_run_id"),
   responsibleUserId: text("responsible_user_id"),
   expectedIssueStatusVersion: bigint("expected_issue_status_version", { mode: "number" }),

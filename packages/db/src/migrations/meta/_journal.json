@@ -2556,6 +2556,13 @@
       "when": 1792498810602,
       "tag": "0366_noisy_lilandra",
       "breakpoints": true
+    },
+    {
+      "idx": 367,
+      "version": "7",
+      "when": 1792507212651,
+      "tag": "0367_abandoned_bucky",
+      "breakpoints": true
     }
   ]
 }
