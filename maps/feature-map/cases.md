@@ -68,6 +68,13 @@ Automated: shared schema tests, case route privacy tests, case handoff service/d
 
 Manual: hand the task through implementation, verification, and correction. Its ID, workspace, thread, and review gates must remain stable. Repeat a request and restart delivery; neither may duplicate work. Try private cases with an unauthorized actor and verify documents, assets, activity, and handoff history remain inaccessible.
 
+While a transfer awaits source release, change its recipient's assignment policy
+or revoke the caller's assignment grant. The worker must retain the pending
+handoff without changing the task owner or phase or waking the recipient. Restore
+the permission and verify that the same receipt can proceed without duplicate
+comments or tasks. Internal authorization context must not appear in public
+history, retry, or cancellation responses.
+
 Small live smoke: select only
 `case-handoffs.runner-codex-subscription.local.receipt-smoke` in Product E2E.
 Three agents use four bounded runs to save, review, and correct a tiny case receipt

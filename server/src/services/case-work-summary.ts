@@ -1,9 +1,10 @@
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, getTableColumns, inArray } from "drizzle-orm";
 import { agents, caseHandoffs, issues, type Db } from "@paperclipai/db";
 import { authorizationService, issueReadSqlCondition, type AuthorizationActor } from "./authorization.js";
 
 type CaseSummaryDb = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
 type CaseWorkIdentity = { id: string; companyId: string; workIssueId: string | null };
+const { actorContext: _actorContext, ...publicHandoffColumns } = getTableColumns(caseHandoffs);
 
 /** Enrich an already-authorized page in batches; never load one task per case. */
 export async function enrichCaseWork<T extends CaseWorkIdentity>(
@@ -20,7 +21,7 @@ export async function enrichCaseWork<T extends CaseWorkIdentity>(
       id: issues.id, identifier: issues.identifier, title: issues.title, status: issues.status,
       statusVersion: issues.statusVersion, assigneeAgentId: issues.assigneeAgentId,
     }).from(issues).where(and(eq(issues.companyId, companyId), inArray(issues.id, issueIds), readCondition)) : [],
-    db.select().from(caseHandoffs).where(and(
+    db.select(publicHandoffColumns).from(caseHandoffs).where(and(
       eq(caseHandoffs.companyId, companyId), inArray(caseHandoffs.caseId, rows.map(row => row.id)),
       inArray(caseHandoffs.state, ["awaiting_release", "pending_dispatch", "awaiting_completion"]),
     )),

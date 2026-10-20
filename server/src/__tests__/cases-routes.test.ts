@@ -987,6 +987,9 @@ describeEmbeddedPostgres("cases routes", () => {
       companyId: company.id, caseId: record.id, issueId: work[index]!.id, version: 1,
       fromAgentId: sender.id, toAgentId: recipient.id, phase: "verification", instructions: "Check the saved work.",
       actorType: "user" as const, actorId: "board-user", wakeupRequestId: randomUUID(),
+      actorContext: { schema: "paperclip.case-handoff-actor.v1", companyId: company.id, actorType: "user", actorId: "board-user",
+        source: "session", runId: null, keyId: null, sessionId: "INTERNAL_SESSION_CANARY", keyScope: { kind: "standard" },
+        onBehalfOfUserId: null, authorizingUserId: null },
       idempotencyKey: randomUUID(), inputFingerprint: "a".repeat(64), state: "pending_dispatch" as const,
     }))).returning();
     const http = request(app(boardActor));
@@ -1008,6 +1011,9 @@ describeEmbeddedPostgres("cases routes", () => {
       const detail = await http.get(`/api/cases/${records[0]!.id}`).expect(200);
       expect(detail.body.workIssue).toEqual(first.workIssue);
       expect(detail.body.pendingHandoff).toEqual(first.pendingHandoff);
+      for (const row of page.body) expect(row.pendingHandoff).not.toHaveProperty("actorContext");
+      expect(detail.body.pendingHandoff).not.toHaveProperty("actorContext");
+      expect(JSON.stringify([page.body, detail.body])).not.toContain("INTERNAL_SESSION_CANARY");
     } finally {
       select.mockRestore();
     }

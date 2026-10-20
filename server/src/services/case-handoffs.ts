@@ -17,12 +17,17 @@ import { issueService } from "./issues.js";
 import { documentService } from "./documents.js";
 import { resolveActorSourceTrustForIssue } from "./source-trust.js";
 import { completeTerminalCaseHandoffsForIssue, pendingCaseHandoffForRun } from "./heartbeat/case-handoff-lifecycle.js";
-import { assertCaseHandoffDispatchAuthority, lockCaseHandoffAuthorityRun } from "./case-handoff-authority.js";
+import { assertCaseHandoffDispatchAuthority, caseHandoffActorContext, lockCaseHandoffAuthorityRun, restoreCaseHandoffActor } from "./case-handoff-authority.js";
 
 export type CaseHandoffRow = typeof caseHandoffs.$inferSelect;
 type CaseRow = typeof cases.$inferSelect;
 type IssueRow = typeof issues.$inferSelect;
 const PENDING = ["awaiting_release", "pending_dispatch", "awaiting_completion"] as const;
+
+function publicHandoff(row: CaseHandoffRow) {
+  const { actorContext: _actorContext, ...publicRow } = row;
+  return publicRow;
+}
 
 function canonical(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
@@ -231,13 +236,24 @@ export function caseHandoffService(db: Db) {
     return row;
   }
 
-  async function apply(tx: Db, row: CaseHandoffRow, caseRow: CaseRow, issue: IssueRow, publications: ActivityPublication[]) {
+  async function apply(tx: Db, row: CaseHandoffRow, caseRow: CaseRow, issue: IssueRow, publications: ActivityPublication[], originalActor?: AuthorizationActor) {
     if (row.destinationKind !== "agent" || !row.toAgentId) throw conflict("Only agent handoffs can transfer a task");
     if (caseRow.workIssueId !== issue.id || caseRow.handoffVersion !== row.version || issue.statusVersion !== row.expectedIssueStatusVersion || issue.responsibleUserId !== row.responsibleUserId ||
         issue.assigneeAgentId !== row.fromAgentId || issue.assigneeUserId) throw conflict("Handoff was superseded by a newer task decision");
     await assertCaseTrustedForExecution(tx, caseRow);
     await eligible(tx, issue);
-    await assertCaseHandoffDispatchAuthority(tx, row, issue, caseRow);
+    const sourceAuthorizer = await assertCaseHandoffDispatchAuthority(tx, row, issue, caseRow);
+    const assigningActor = originalActor ?? await restoreCaseHandoffActor(tx, row, issue, sourceAuthorizer);
+    // Acceptance does not reserve permission. Recheck the original principal at
+    // the actual transfer, while it still owns/reads the outgoing task.
+    try {
+      await authorizeTask(tx, assigningActor, row.companyId, issue, issue.projectId, row.toAgentId);
+    } catch (error) {
+      // The records were just locked and exist. A hidden task is a revocable
+      // actor-access hold, not a deleted task that should cancel durable intent.
+      if (!originalActor && error instanceof HttpError && error.status === 404) throw forbidden("Handoff original actor can no longer access the task");
+      throw error;
+    }
     const actor: AuthorizationActor = { type: "agent", agentId: row.toAgentId, companyId: row.companyId, onBehalfOfUserId: row.responsibleUserId };
     await assertAssignableAgent(tx, row.companyId, row.toAgentId, { kind: "work" });
     if (!(await canActorReceiveCase(tx, actor, caseRow, issue.id, row.toAgentId))) throw forbidden("Recipient cannot access the case");
@@ -301,7 +317,7 @@ export function caseHandoffService(db: Db) {
     await tx.update(cases).set({ handoffVersion: version, updatedAt: new Date() }).where(eq(cases.id, caseRow.id));
     const [row] = await tx.insert(caseHandoffs).values({ id: randomUUID(), companyId, caseId: caseRow.id, issueId: issue.id,
       version, destinationKind: "done", fromAgentId: issue.assigneeAgentId, toAgentId: null, phase: "done",
-      instructions: input.instructions, commentId: comment.id, ...who, sourceRunId: source?.id ?? null,
+      instructions: input.instructions, commentId: comment.id, ...who, actorContext: caseHandoffActorContext(actor, companyId), sourceRunId: source?.id ?? null,
       responsibleUserId: issue.responsibleUserId, expectedIssueStatusVersion: issue.statusVersion,
       idempotencyKey: input.idempotencyKey, inputFingerprint: fingerprint, wakeupRequestId: randomUUID(), state: "awaiting_completion",
     }).returning();
@@ -492,12 +508,12 @@ export function caseHandoffService(db: Db) {
         [caseRow] = await tx.update(cases).set({ workIssueId: issue.id, handoffVersion: version, updatedAt: new Date() }).where(eq(cases.id, caseRow!.id)).returning();
         const [saved] = await tx.insert(caseHandoffs).values({ id, companyId, caseId: caseRow!.id, issueId: issue.id, version,
           fromAgentId: issue.assigneeAgentId, toAgentId: input.toAgentId, phase: input.phase, instructions: input.instructions,
-          commentId: comment.id, ...who, sourceRunId, responsibleUserId: issue.responsibleUserId, expectedIssueStatusVersion: issue.statusVersion,
+          commentId: comment.id, ...who, actorContext: caseHandoffActorContext(actor, companyId), sourceRunId, responsibleUserId: issue.responsibleUserId, expectedIssueStatusVersion: issue.statusVersion,
           idempotencyKey: input.idempotencyKey, inputFingerprint: fingerprint, wakeupRequestId: randomUUID(), state: sourceRunId ? "awaiting_release" : "pending_dispatch",
         }).returning();
         let row = saved!;
         await event(tx, row, "handoff_requested", publications);
-        if (!sourceRunId) row = await apply(tx, row, caseRow!, issue, publications);
+        if (!sourceRunId) row = await apply(tx, row, caseRow!, issue, publications, actor);
         await notifyDeliveryWork(tx, DELIVERY_QUEUES.caseHandoffs, row.id);
         return result(row, issue, actor, false);
       });
@@ -532,7 +548,7 @@ export function caseHandoffService(db: Db) {
           try { await authorizeHandoffControl(db, actor, active, issue, false); canControl = true; } catch { /* A readable history need not grant task control. */ }
         }
       }
-      return { items: page.map(row => ({ ...row, toAgentName: row.toAgentId ? names.get(row.toAgentId) ?? null : null, fromAgentName: row.fromAgentId ? names.get(row.fromAgentId) ?? null : null, canControl })),
+      return { items: page.map(row => ({ ...publicHandoff(row), toAgentName: row.toAgentId ? names.get(row.toAgentId) ?? null : null, fromAgentName: row.fromAgentId ? names.get(row.fromAgentId) ?? null : null, canControl })),
         nextCursor: rows.length > limit && last ? Buffer.from(JSON.stringify({ at: last.createdAt.toISOString(), id: last.id })).toString("base64url") : null, canControl };
     },
 
@@ -544,8 +560,8 @@ export function caseHandoffService(db: Db) {
       const [issue] = await db.select().from(issues).where(eq(issues.id, row.issueId));
       if (!issue) throw notFound("Task not found");
       await authorizeHandoffControl(db, actor, row, issue);
-      if (row.destinationKind === "done") return row; // Completion is owned by the ordinary task completion path.
-      if (!PENDING.includes(row.state as typeof PENDING[number])) return row;
+      if (row.destinationKind === "done") return publicHandoff(row); // Completion is owned by the ordinary task completion path.
+      if (!PENDING.includes(row.state as typeof PENDING[number])) return publicHandoff(row);
       let publication: ActivityPublication | null = null;
       const retried = await db.transaction(async tx => {
         await notifyDeliveryWork(tx, DELIVERY_QUEUES.caseHandoffs, row.id);
@@ -559,7 +575,7 @@ export function caseHandoffService(db: Db) {
         await notifyDeliveryWork(tx, DELIVERY_QUEUES.caseHandoffs, row.id); return updated ?? row;
       });
       if (publication) publishActivity(publication);
-      return retried;
+      return publicHandoff(retried);
     },
 
     async cancel(actor: AuthorizationActor, caseId: string, handoffId: string) {
@@ -571,7 +587,7 @@ export function caseHandoffService(db: Db) {
       if (!issue) throw notFound("Task not found");
       await authorizeHandoffControl(db, actor, row, issue, false);
       if (PENDING.includes(row.state as typeof PENDING[number])) await cancelPendingCaseHandoffsForIssue(db, issue.id, "Cancelled by operator", actor, row.id);
-      return db.select().from(caseHandoffs).where(eq(caseHandoffs.id, row.id)).then(rows => rows[0]!);
+      return db.select().from(caseHandoffs).where(eq(caseHandoffs.id, row.id)).then(rows => publicHandoff(rows[0]!));
     },
 
     /** Call only after the runtime's authoritative settlement predicate succeeds. */

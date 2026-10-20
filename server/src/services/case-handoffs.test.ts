@@ -3,7 +3,7 @@ import express from "express";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { and, eq, sql } from "drizzle-orm";
-import { activityLog, agentWakeupRequests, agents, caseAccessSources, caseEvents, caseHandoffs, caseIssueLinks, cases, companies, createDb, documentRevisions, documents, dotAgentBindings, heartbeatRuns, issueComments, issueDocuments, issues, issueWorkProducts } from "@paperclipai/db";
+import { activityLog, agentApiKeys, agentWakeupRequests, agents, authSessions, authUsers, boardApiKeys, companyMemberships, principalPermissionGrants, caseAccessSources, caseEvents, caseHandoffs, caseIssueLinks, cases, companies, createDb, documentRevisions, documents, dotAgentBindings, heartbeatRuns, issueComments, issueDocuments, issues, issueWorkProducts } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
 import { caseHandoffRoutes } from "../routes/case-handoffs.js";
 import { errorHandler } from "../middleware/error-handler.js";
@@ -19,7 +19,9 @@ import { nativeRuntimeContextFixture } from "./native-runtime/runtime-context.te
 import { buildLowTrustSourceTrust } from "./source-trust.js";
 import { issueService } from "./issues.js";
 import { documentService } from "./documents.js";
+import type { AuthorizationActor } from "./authorization.js";
 import { recoveryService } from "./recovery/service.js";
+import { enrichCaseWork } from "./case-work-summary.js";
 
 describe("durable same-task case handoffs", () => {
   let temporary: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
@@ -36,6 +38,8 @@ describe("durable same-task case handoffs", () => {
     await db.delete(caseHandoffs); await db.delete(caseIssueLinks); await db.delete(cases);
     await db.delete(documentRevisions); await db.delete(documents);
     await db.delete(issues); await db.delete(heartbeatRuns); await db.delete(agentWakeupRequests);
+    await db.delete(agentApiKeys); await db.delete(boardApiKeys); await db.delete(authSessions);
+    await db.delete(principalPermissionGrants); await db.delete(companyMemberships); await db.delete(authUsers);
     await db.delete(agents); await db.delete(companies);
   });
 
@@ -70,6 +74,40 @@ describe("durable same-task case handoffs", () => {
     await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "running", runtimeMode: "legacy", invocationSource: "assignment", triggerDetail: "system", contextSnapshot: { issueId } });
     await db.update(issues).set({ status: "in_progress", executionRunId: runId, checkoutRunId: runId }).where(eq(issues.id, issueId));
     return runId;
+  }
+
+  async function delayedTransfer(prepare?: (f: Awaited<ReturnType<typeof fixture>>, taskId: string, runId: string) => Promise<AuthorizationActor | void>) {
+    const f = await fixture();
+    let at = new Date(Date.now() + 60_000);
+    const q = queue(() => at);
+    const first = await f.service.handoff(f.companyId, board, f.input);
+    await q.worker.sweepPending();
+    const runId = await sourceRun(f.companyId, f.triage, first.taskId);
+    const actor = await prepare?.(f, first.taskId, runId) ?? {
+      type: "agent", agentId: f.triage, companyId: f.companyId, runId, source: "agent_jwt",
+    } satisfies AuthorizationActor;
+    const [task] = await db.select().from(issues).where(eq(issues.id, first.taskId));
+    const receipt = await f.service.handoff(f.companyId, actor, { case: { id: first.caseId }, idempotencyKey: randomUUID(),
+      expectedHandoffVersion: 1, expectedIssueStatusVersion: task!.statusVersion,
+      toAgentId: f.engineer, phase: "implementation", instructions: "Use the saved findings" });
+    expect(receipt.state).toBe("awaiting_release");
+    return { ...f, first, runId, actor, task: task!, receipt, q,
+      async release() {
+        await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, runId));
+        await recordCaseHandoffExecutionReleased(db, runId, first.taskId);
+      },
+      async sweep() { at = new Date(at.getTime() + 60_000); await q.worker.sweepPending(); },
+      async assertHeld(message: RegExp) {
+        const [handoff] = await db.select().from(caseHandoffs).where(eq(caseHandoffs.id, receipt.handoffId));
+        expect(handoff).toMatchObject({ state: "awaiting_release", lastErrorCode: "access_or_admission_blocked" });
+        expect(handoff!.lastError).toMatch(message);
+        expect((await db.select().from(issues).where(eq(issues.id, first.taskId)))[0])
+          .toMatchObject({ assigneeAgentId: f.triage, status: task!.status, statusVersion: task!.statusVersion });
+        expect((await db.select().from(cases).where(eq(cases.id, first.caseId)))[0]!.phase).toBe("triage");
+        expect(q.wakeup).toHaveBeenCalledTimes(1);
+        expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, handoff!.wakeupRequestId))).toEqual([]);
+      },
+    };
   }
 
   async function terminalFixture() {
@@ -602,6 +640,191 @@ describe("durable same-task case handoffs", () => {
     expect(waiting).toMatchObject({ state: "awaiting_release", lastErrorCode: "access_or_admission_blocked" });
     expect(q.wakeup).toHaveBeenCalledTimes(1);
     expect((await db.select().from(issues).where(eq(issues.id, first.taskId)))[0]!.assigneeAgentId).toBe(f.triage);
+  });
+
+  it("holds delayed assignment after recipient policy revocation and resumes when restored", async () => {
+    const f = await fixture();
+    let at = new Date(Date.now() + 60_000);
+    const q = queue(() => at);
+    const first = await f.service.handoff(f.companyId, board, f.input);
+    await q.worker.sweepPending();
+    const runId = await sourceRun(f.companyId, f.triage, first.taskId);
+    const actor = { type: "agent" as const, agentId: f.triage, companyId: f.companyId, runId, source: "agent_jwt" as const };
+    const [before] = await db.select().from(issues).where(eq(issues.id, first.taskId));
+    const next = await f.service.handoff(f.companyId, actor, {
+      case: { id: first.caseId }, idempotencyKey: randomUUID(), expectedHandoffVersion: 1,
+      expectedIssueStatusVersion: before!.statusVersion, toAgentId: f.engineer,
+      phase: "implementation", instructions: "Implement the saved findings after release.",
+    });
+    expect(next).toMatchObject({ state: "awaiting_release", callerMustYield: true });
+    await db.update(agents).set({ permissions: { authorizationPolicy: { protectedAgent: { blockAssignment: true } } } })
+      .where(eq(agents.id, f.engineer));
+    await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, runId));
+    await recordCaseHandoffExecutionReleased(db, runId, first.taskId);
+    const [settled] = await db.select().from(issues).where(eq(issues.id, first.taskId));
+    expect(settled!.statusVersion).toBe(before!.statusVersion);
+    await q.worker.sweepPending();
+    const [held] = await db.select().from(caseHandoffs).where(eq(caseHandoffs.id, next.handoffId));
+    expect(held).toMatchObject({ state: "awaiting_release", lastErrorCode: "access_or_admission_blocked" });
+    expect(held!.lastError).toMatch(/protected-agent policy/);
+    expect((await db.select().from(issues).where(eq(issues.id, first.taskId)))[0])
+      .toMatchObject({ assigneeAgentId: f.triage, status: "in_progress", statusVersion: before!.statusVersion });
+    expect((await db.select().from(cases).where(eq(cases.id, first.caseId)))[0]!.phase).toBe("triage");
+    expect(q.wakeup).toHaveBeenCalledTimes(1);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, held!.wakeupRequestId))).toEqual([]);
+    await db.update(agents).set({ permissions: {} }).where(eq(agents.id, f.engineer));
+    at = new Date(at.getTime() + 60_000);
+    await queue(() => at).worker.sweepPending();
+    expect((await db.select().from(caseHandoffs).where(eq(caseHandoffs.id, next.handoffId)))[0]!.state).toBe("delivered");
+    expect((await db.select().from(issues).where(eq(issues.id, first.taskId)))[0])
+      .toMatchObject({ id: first.taskId, status: "todo", assigneeAgentId: f.engineer });
+    expect((await db.select().from(cases).where(eq(cases.id, first.caseId)))[0]!.phase).toBe("implementation");
+  });
+
+  it("rechecks the original agent's current assignment grant on a protected task", async () => {
+    let grantId = "";
+    const f = await delayedTransfer(async (f, taskId) => {
+      await db.update(issues).set({ executionPolicy: { authorizationPolicy: { assignmentPolicy: { mode: "protected" } } } }).where(eq(issues.id, taskId));
+      await db.insert(companyMemberships).values({ companyId: f.companyId, principalType: "agent", principalId: f.triage, status: "active", membershipRole: "member" });
+      const [grant] = await db.insert(principalPermissionGrants).values({ companyId: f.companyId, principalType: "agent", principalId: f.triage, permissionKey: "tasks:assign" }).returning();
+      grantId = grant!.id;
+    });
+    await db.delete(principalPermissionGrants).where(eq(principalPermissionGrants.id, grantId));
+    await f.release(); await f.sweep();
+    await f.assertHeld(/protected|assignment|permission/i);
+    await db.insert(principalPermissionGrants).values({ companyId: f.companyId, principalType: "agent", principalId: f.triage, permissionKey: "tasks:assign" });
+    await f.sweep();
+    expect((await db.select().from(caseHandoffs).where(eq(caseHandoffs.id, f.receipt.handoffId)))[0]!.state).toBe("delivered");
+  });
+
+  it("rechecks the original agent's active authority after settlement", async () => {
+    const f = await delayedTransfer();
+    await db.update(agents).set({ status: "terminated" }).where(eq(agents.id, f.triage));
+    await f.release(); await f.sweep(); await f.assertHeld(/actor agent.*not active/i);
+  });
+
+  it.each(["revoked", "scope", "responsible_user"] as const)("retains and revalidates the original agent key (%s)", async reason => {
+    const keyId = randomUUID(), userId = randomUUID();
+    const f = await delayedTransfer(async (f, _taskId, runId) => {
+      await db.insert(authUsers).values({ id: userId, name: "Responsible operator", email: `${userId}@example.test`, createdAt: new Date(), updatedAt: new Date() });
+      await db.insert(companyMemberships).values({ companyId: f.companyId, principalType: "user", principalId: userId, status: "active", membershipRole: "owner" });
+      await db.insert(agentApiKeys).values({ id: keyId, companyId: f.companyId, agentId: f.triage, name: "Intake key", keyHash: randomUUID(), responsibleUserId: userId, scopeConfig: { kind: "standard" } });
+      return { type: "agent", agentId: f.triage, companyId: f.companyId, runId, source: "agent_key", keyId, keyScope: { kind: "standard" }, onBehalfOfUserId: userId };
+    });
+    await db.update(agentApiKeys).set(reason === "revoked" ? { revokedAt: new Date() } : reason === "scope" ?
+      { scopeConfig: { kind: "skill_test", issueId: f.first.taskId } } : { responsibleUserId: randomUUID() }).where(eq(agentApiKeys.id, keyId));
+    await f.release(); await f.sweep(); await f.assertHeld(/key was revoked or its scope changed/i);
+  });
+
+  it.each([true, false])("preserves a current agent key's accepted authority (run header: %s)", async withRunHeader => {
+    const userId = randomUUID(), keyId = randomUUID();
+    const f = await delayedTransfer(async (f, taskId, runId) => {
+      await db.insert(authUsers).values({ id: userId, name: "Key owner", email: `${userId}@example.test`, createdAt: new Date(), updatedAt: new Date() });
+      await db.insert(companyMemberships).values({ companyId: f.companyId, principalType: "user", principalId: userId, status: "active", membershipRole: "owner" });
+      await db.insert(agentApiKeys).values({ id: keyId, companyId: f.companyId, agentId: f.triage, name: "Assignment key", keyHash: randomUUID(), responsibleUserId: userId });
+      // A checkout may outlast execution ownership. An ordinary authenticated
+      // key can hand it off without claiming a JWT-bound run identity.
+      if (!withRunHeader) await db.update(issues).set({ executionRunId: null }).where(eq(issues.id, taskId));
+      return { type: "agent", companyId: f.companyId, agentId: f.triage, source: "agent_key", keyId,
+        onBehalfOfUserId: userId, ...(withRunHeader ? { runId } : {}) };
+    });
+    await f.release(); await f.sweep();
+    expect((await db.select().from(caseHandoffs).where(eq(caseHandoffs.id, f.receipt.handoffId)))[0]!.state).toBe("delivered");
+    expect((await db.select().from(issues).where(eq(issues.id, f.first.taskId)))[0]).toMatchObject({ assigneeAgentId: f.engineer, status: "todo" });
+  });
+
+  it("does not drop an external authorizer's current permission ceiling", async () => {
+    const userId = randomUUID();
+    const f = await delayedTransfer(async (f, _taskId, runId) => {
+      await db.insert(authUsers).values({ id: userId, name: "Authorizing operator", email: `${userId}@example.test`, createdAt: new Date(), updatedAt: new Date() });
+      await db.insert(companyMemberships).values({ companyId: f.companyId, principalType: "user", principalId: userId, status: "active", membershipRole: "owner" });
+      return { type: "agent", agentId: f.triage, companyId: f.companyId, runId, source: "agent_jwt", authorizingUserId: userId };
+    });
+    await db.delete(companyMemberships).where(eq(companyMemberships.principalId, userId));
+    await f.release(); await f.sweep(); await f.assertHeld(/actor.*access|authoriz|permission|membership/i);
+  });
+
+  it.each(["missing", "identity", "scope", "run"] as const)("fails closed on %s retained actor provenance", async reason => {
+    const f = await delayedTransfer();
+    const [row] = await db.select().from(caseHandoffs).where(eq(caseHandoffs.id, f.receipt.handoffId));
+    await db.update(caseHandoffs).set({ actorContext: reason === "missing" ? null : reason === "identity" ?
+      { ...row!.actorContext, actorId: f.engineer } : reason === "run" ? { ...row!.actorContext, runId: randomUUID() } : { ...row!.actorContext, keyScope: { kind: "invented" } } }).where(eq(caseHandoffs.id, f.receipt.handoffId));
+    await f.release(); await f.sweep(); await f.assertHeld(reason === "run" ? /execution identity changed/i : /original actor context is unavailable/i);
+  });
+
+  it("rechecks board membership without promoting its sentinel identity to local authority", async () => {
+    const userId = "board";
+    const f = await delayedTransfer(async f => {
+      await db.insert(authUsers).values({ id: userId, name: "Authenticated board", email: "board@example.test", createdAt: new Date(), updatedAt: new Date() });
+      await db.insert(companyMemberships).values({ companyId: f.companyId, principalType: "user", principalId: userId, status: "active", membershipRole: "owner" });
+      return { type: "board", userId, source: "cloud_tenant", companyIds: [f.companyId] };
+    });
+    await db.delete(companyMemberships).where(eq(companyMemberships.principalId, userId));
+    await f.release(); await f.sweep(); await f.assertHeld(/actor.*access|permission|membership|grant/i);
+  });
+
+  it.each(["board_key_revoked", "board_key_expired", "session_deleted", "session_expired"] as const)("revalidates original board credentials (%s)", async reason => {
+    const userId = randomUUID(), credentialId = randomUUID();
+    const key = reason.startsWith("board_key");
+    const f = await delayedTransfer(async f => {
+      await db.insert(authUsers).values({ id: userId, name: "Board operator", email: `${userId}@example.test`, createdAt: new Date(), updatedAt: new Date() });
+      await db.insert(companyMemberships).values({ companyId: f.companyId, principalType: "user", principalId: userId, status: "active", membershipRole: "owner" });
+      if (key) await db.insert(boardApiKeys).values({ id: credentialId, userId, name: "CLI operator", keyHash: randomUUID(), expiresAt: new Date(Date.now() + 60_000) });
+      else await db.insert(authSessions).values({ id: credentialId, userId, token: randomUUID(), createdAt: new Date(), updatedAt: new Date(), expiresAt: new Date(Date.now() + 60_000) });
+      return { type: "board", userId, companyIds: [f.companyId], ...(key ? { source: "board_key", keyId: credentialId } : { source: "session", sessionId: credentialId }) };
+    });
+    if (reason === "board_key_revoked") await db.update(boardApiKeys).set({ revokedAt: new Date() }).where(eq(boardApiKeys.id, credentialId));
+    else if (reason === "board_key_expired") await db.update(boardApiKeys).set({ expiresAt: new Date(0) }).where(eq(boardApiKeys.id, credentialId));
+    else if (reason === "session_deleted") await db.delete(authSessions).where(eq(authSessions.id, credentialId));
+    else await db.update(authSessions).set({ expiresAt: new Date(0) }).where(eq(authSessions.id, credentialId));
+    await f.release(); await f.sweep(); await f.assertHeld(/board (key|session) was revoked or expired/i);
+  });
+
+  it("cannot restore recorded local board authority in a managed Cloud instance", async () => {
+    const f = await delayedTransfer(async () => board);
+    await f.release();
+    vi.stubEnv("PAPERCLIP_CLOUD_TENANT_SERVER_TOKEN", "test-cloud-instance");
+    try { await f.sweep(); await f.assertHeld(/local board authority is unavailable/i); }
+    finally { vi.unstubAllEnvs(); }
+  });
+
+  it("preserves private ownership transfer and does not reauthorize the old owner after assignment", async () => {
+    const f = await delayedTransfer(async (_f, taskId) => { await db.update(issues).set({ visibility: "private" }).where(eq(issues.id, taskId)); });
+    await f.release();
+    expect(await f.service.applyPending(f.receipt.handoffId)).toMatchObject({ state: "pending_dispatch" });
+    const [caseRow] = await db.select().from(cases).where(eq(cases.id, f.first.caseId));
+    expect(await canActorReadCase(db, f.actor, caseRow!)).toBe(false);
+    await expect(f.service.authorizePendingDispatch(f.receipt.handoffId)).resolves.toBeUndefined();
+    await f.sweep();
+    expect((await db.select().from(caseHandoffs).where(eq(caseHandoffs.id, f.receipt.handoffId)))[0]!.state).toBe("delivered");
+    expect((await db.select().from(issues).where(eq(issues.id, f.first.taskId)))[0])
+      .toMatchObject({ id: f.first.taskId, visibility: "private", assigneeAgentId: f.engineer, status: "todo" });
+  });
+
+  it("omits server-only actor provenance from REST history, retry, cancel, and execution context", async () => {
+    const f = await delayedTransfer();
+    const [stored] = await db.select().from(caseHandoffs).where(eq(caseHandoffs.id, f.receipt.handoffId));
+    expect(stored!.actorContext).toMatchObject({ schema: "paperclip.case-handoff-actor.v1", actorId: f.triage, source: "agent_jwt", runId: f.runId });
+    const app = express(); app.use(express.json()); app.use((req, _res, next) => { req.actor = board; next(); });
+    app.use("/api", caseHandoffRoutes(db)); app.use(errorHandler);
+    const history = await request(app).get(`/api/cases/${f.first.caseId}/handoffs`).expect(200);
+    expect(history.body.items).toHaveLength(2);
+    const [caseRow] = await db.select().from(cases).where(eq(cases.id, f.first.caseId));
+    const summary = await enrichCaseWork(db, f.companyId, [caseRow!], board);
+    expect(summary[0]!.pendingHandoff).toMatchObject({ id: f.receipt.handoffId });
+    expect(summary[0]!.pendingHandoff).not.toHaveProperty("actorContext");
+    for (const row of history.body.items) expect(row).not.toHaveProperty("actorContext");
+    const retry = await request(app).post(`/api/cases/${f.first.caseId}/handoffs/${f.receipt.handoffId}/retry`).expect(200);
+    expect(retry.body).not.toHaveProperty("actorContext");
+    const context = await getCaseExecutionContext(db, { companyId: f.companyId, issueId: f.first.taskId, agentId: f.triage, runId: f.runId });
+    expect(JSON.stringify(context)).not.toContain("paperclip.case-handoff-actor");
+    const events = await db.select().from(caseEvents).where(eq(caseEvents.caseId, f.first.caseId));
+    expect(JSON.stringify(events)).not.toContain("actorContext");
+    const cancelled = await request(app).post(`/api/cases/${f.first.caseId}/handoffs/${f.receipt.handoffId}/cancel`).expect(200);
+    expect(cancelled.body).toMatchObject({ state: "cancelled" });
+    expect(cancelled.body).not.toHaveProperty("actorContext");
+    const replayCancel = await request(app).post(`/api/cases/${f.first.caseId}/handoffs/${f.receipt.handoffId}/cancel`).expect(200);
+    expect(replayCancel.body).not.toHaveProperty("actorContext");
   });
 
   it("records terminal intent without assignment authority, source yield, task completion, or another wake", async () => {

@@ -172,6 +172,12 @@ Retention: whole-company deletion removes case history before dependent tasks/ag
 
 Policy: enableCases; standard mode; ordinary task creation/assignment authority; agents transfer only their own work; current case/task versions; company and retained task/project access intersection; existing review, Stop, budget, and workspace gates. Idempotency belongs to the authenticated principal, not a provider run. Cancellation remains available while the feature is disabled.
 
+Delayed assignment rechecks the original caller's current assignment authority
+using internal, server-derived provenance. The context is not returned by
+history or recovery APIs. Missing historical provenance fails closed. After an
+assignment is applied, delivery checks recipient admission rather than requiring
+the former assignee to retain task access.
+
 Evidence: `verified` — 2026-10-19 working-tree implementation. The [assembled native integration](../../server/src/__tests__/case-handoff-native.integration.test.ts) passed with actual runnerd and a controlled provider; [legacy HTTP integration](../../server/src/__tests__/case-handoff-legacy.integration.test.ts) and real-database authority/recovery tests passed. The later API-key campaign `local-2026-10-19T19-14-18-642Z` completed four real native runs and terminal case closure. The earlier subscription HTTP 429 remains recorded as a failed attempt; it was not regraded. See the [verification record](../../doc/plans/2026-10-19-persistent-case-handoffs.md).
 
 Verification: `passed` — deterministic boundaries include native tool acceptance/yield, process settlement, same-task successor context, authenticated HTTP replay, denied private sources, version conflicts, review gates and restart/acknowledgment recovery. The configured-provider correction round trip passed using API credentials. The latest `local-2026-10-19T21-39-45-440Z` campaign passed 13 checks with task-owned documents, four nonoverlapping runs, same-task transfers, returning-builder session reuse and terminal case closure. The earlier `local-2026-10-19T21-32-43-612Z` campaign remains failed because the task revision API omitted stored writer-run attribution; the subsequent authorized projection fix was qualified by the new campaign. Compact context content/omission assertions retain separate deterministic evidence.
