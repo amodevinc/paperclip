@@ -78,7 +78,7 @@ import { NATIVE_PREPARATION_FENCING_VERSION } from "../native-runtime/native-act
 import type { issueService } from "../issues.js";
 import { buildPlanReviewContext } from "../plan-review-context.js";
 import { resolvePaperclipRunnerIdleTimeoutMs } from "@paperclipai/adapter-utils";
-import { selectPaperclipTaskMarkdown } from "@paperclipai/adapter-utils/server-utils";
+import { normalizePaperclipWakePayload, selectPaperclipTaskMarkdown } from "@paperclipai/adapter-utils/server-utils";
 import type { ProviderResourceDisposition } from "../environment-runtime.js";
 
 type Run = typeof heartbeatRuns.$inferSelect;
@@ -785,7 +785,10 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
                     const savedIssue = parseObject(parseObject(previousNativeRun.contextSnapshot).paperclipIssue);
                     if (savedIssue.id !== issueRef.id || typeof savedIssue.title !== "string" ||
                       (savedIssue.description !== null && typeof savedIssue.description !== "string")) return null;
-                    return { runId: previousNativeRun.id, task: { title: savedIssue.title, description: savedIssue.description } };
+                    const previousWake = normalizePaperclipWakePayload(parseObject(previousNativeRun.contextSnapshot).paperclipWake);
+                    return { runId: previousNativeRun.id, task: { title: savedIssue.title, description: savedIssue.description },
+                      githubReviewConfigurationKeys: previousWake?.githubReviewConfigurations.map((config) => config.key),
+                    };
                   }
                   return { runId: previousNativeRun.id, task: previousTask };
                 } catch {

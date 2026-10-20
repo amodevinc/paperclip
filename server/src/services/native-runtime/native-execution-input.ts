@@ -63,7 +63,7 @@ export interface BuildNativeExecutionInput {
   /** Skill keys selected from the admitted, manager-authored GitHub configuration. */
   githubInstructionSkillKeys?: readonly string[];
   resumedSession?: boolean;
-  previousTurn?: { runId: string; task: { title: string; description: string | null } } | null;
+  previousTurn?: { runId: string; task: { title: string; description: string | null }; githubReviewConfigurationKeys?: string[] } | null;
   conversationMode?: boolean;
   agentId: string;
   agentKeyId?: string;
@@ -230,6 +230,7 @@ export function buildNativeExecutionInput(input: BuildNativeExecutionInput): Nat
         wakePayload: input.wakePayload,
         previousRunId: input.previousTurn.runId,
         previousIssue: input.previousTurn.task,
+        previousGitHubReviewConfigurationKeys: input.previousTurn.githubReviewConfigurationKeys,
         allowExternalChat: true,
         issue: input.issue,
       }),

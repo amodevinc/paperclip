@@ -2,6 +2,7 @@ import { skillAccessService } from "../skill-access.js";
 import type { AuthorizationActor } from "../authorization.js";
 import { spekoToolsForSession } from "../voice/speko-agent-tools.js";
 import { githubConfiguredInstructionSources } from "../chat-github-review-policy.js";
+import { resolveGitHubReviewInstructions } from "../chat-channels/github/review-instructions.js";
 import { CONFIGURED_ENVIRONMENT_KEYS } from "../../vendor/paperclip-runner/index.js";
 import { ASSIGNED_MCP_SERVER_NAME } from "../mcp-tool-names.js";
 import { externalConversationStateSql } from "../slack-conversation-state.js";
@@ -2658,6 +2659,9 @@ export async function buildPaperclipWakePayload(input: {
     chatCompletionUpdates: input.contextSnapshot.chatCompletionUpdates ?? null,
     attachmentOmissions,
     externalChatProvider,
+    githubReviewConfigurations: externalChatProvider === "github" && issueId && input.agentId
+      ? await resolveGitHubReviewInstructions({ db: input.db, companyId: input.companyId, agentId: input.agentId, issueId, commentIds })
+      : [],
     recovery:
       recoveryStillActive
         ? {

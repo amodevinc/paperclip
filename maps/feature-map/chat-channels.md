@@ -52,6 +52,15 @@ and combined requests with separate pre-upgrade placeholders.
 
 Manual: For each supported provider being changed, send a unique message, verify the intended agent/company receives it, and inspect the actual external reply in the original thread. Repeat with an unlinked/unauthorized sender, duplicate inbound delivery, and one supported attachment. Record provider-specific results separately.
 
+GitHub review prompt regression: open a PR and push twice. Each task message
+contains the event and commit identifiers; configuration comes from the admitted
+delivery snapshot and the PR description is fetched when needed. Inspect the
+native provider's submitted envelopes: a verified resume sends only the current
+batch and any changed configuration, while a fresh session receives full review
+instructions and task context. Change configuration between pushes and verify
+the queued older request retains its original snapshot. Integration fixtures
+cover the database and prompt contracts; they do not prove live provider delivery.
+
 For Slack, enable **Require at-mention** and **Allow direct messages**. Send a
 plain DM and follow up without a mention: both should reach the agent, with
 top-level replies to top-level DMs. Channel messages and thread replies still
