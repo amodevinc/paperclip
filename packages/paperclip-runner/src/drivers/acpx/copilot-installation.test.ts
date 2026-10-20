@@ -85,9 +85,27 @@ async function withCopilotTestPlatform<T>(arch: "x64" | "arm64", run: () => Prom
 vi.mock("./installation-integrity.js", () => ({ verifyNativeAcpxInstallation: vi.fn() }));
 
 describe("Copilot build-owned installation", () => {
-  it("admits the qualified profile without a pending qualification marker", () => {
-    expect(QUALIFIED_ACPX_PROFILES.copilot.agentProfileVersion).toBe(47);
-    expect(QUALIFIED_ACPX_PROFILES.copilot.qualificationStatus).toBeUndefined();
+  it("keeps the case-contract candidate pending compatibility revalidation", () => {
+    expect(QUALIFIED_ACPX_PROFILES.copilot.agentProfileVersion).toBe(48);
+    expect(QUALIFIED_ACPX_PROFILES.copilot.qualificationStatus).toBe("pending");
+  });
+
+  it("preserves qualified v47 while binding the additive case contracts in v48", async () => {
+    const prior = JSON.parse(readFileSync(new URL("../../../test/fixtures/copilot-profile-v47-identity.json", import.meta.url), "utf8"));
+    const current = JSON.parse(readFileSync(new URL("../../../test/fixtures/copilot-profile-v48-identity.json", import.meta.url), "utf8"));
+    expect(prior.commandDigest).toBe("sha256:55044aa235e88b3fe36ec8a556ee1e3382590870aab907e4462ef7d64af49cea");
+    const sortedPrior = Object.fromEntries(Object.entries(prior.declaration).sort(([a], [b]) => a.localeCompare(b)));
+    expect(`sha256:${createHash("sha256").update(JSON.stringify(sortedPrior)).digest("hex")}`).toBe(prior.commandDigest);
+    expect(Object.keys(current.declaration).sort()).toEqual(Object.keys(prior.declaration).sort());
+    expect(Object.keys(current.declaration).filter(key => current.declaration[key] !== prior.declaration[key]).sort()).toEqual([
+      "agentProfileVersion", "nativeRuntimeContextSourceSha256", "profileCompatibilitySourceSha256",
+      "semanticCompletionContractSourceSha256", "semanticSchemaBundleSourceSha256", "semanticValidatorsSourceSha256",
+    ]);
+    expect(isSupportedAcpxProfileVersion("copilot", 47)).toBe(true);
+    vi.mocked(verifyNativeAcpxInstallation).mockClear();
+    await expect(verifyCopilotInstallation({ ...QUALIFIED_ACPX_PROFILES.copilot,
+      agentProfileVersion: 47, commandDigest: prior.commandDigest })).rejects.toThrow("exact pinned");
+    expect(verifyNativeAcpxInstallation).not.toHaveBeenCalled();
   });
 
   it("preserves v12 history and changes only the version and four shared source bindings", () => {
@@ -258,7 +276,7 @@ describe("Copilot build-owned installation", () => {
     expect(QUALIFIED_ACPX_PROFILES.copilot.commandDigest).toBe(identity.commandDigest);
     const sorted = Object.fromEntries(Object.entries(identity.declaration).sort(([a], [b]) => a.localeCompare(b)));
     expect(`sha256:${createHash("sha256").update(JSON.stringify(sorted)).digest("hex")}`).toBe(identity.commandDigest);
-    for (const [relative, field] of [...PERMISSION_POLICY_SOURCES, ...COPILOT_DISPLAY_SOURCES, ...SEMANTIC_RECEIPT_SOURCES, ["copilot-policy.ts", "policySha256"], ["profile-compatibility.ts", "profileCompatibilitySourceSha256"], ["provider-assets-root.ts", "assetOwnershipSourceSha256"], ["../../../scripts/install-copilot-assets.mjs", "assetInstallerSourceSha256"], ["../../../scripts/materialize-copilot-binary.mjs", "distributionSourceSha256"], ["../../../scripts/copilot-inner-distribution.mjs", "innerDistributionSourceSha256"], ["../../../../../patches/acpx@0.13.1.patch", "acpxPatchSha256"]]) {
+    for (const [relative, field] of [...PERMISSION_POLICY_SOURCES, ...COPILOT_DISPLAY_SOURCES, ...SEMANTIC_RECEIPT_SOURCES, ["../../contracts/runtime-context.ts", "nativeRuntimeContextSourceSha256"], ["copilot-policy.ts", "policySha256"], ["profile-compatibility.ts", "profileCompatibilitySourceSha256"], ["provider-assets-root.ts", "assetOwnershipSourceSha256"], ["../../../scripts/install-copilot-assets.mjs", "assetInstallerSourceSha256"], ["../../../scripts/materialize-copilot-binary.mjs", "distributionSourceSha256"], ["../../../scripts/copilot-inner-distribution.mjs", "innerDistributionSourceSha256"], ["../../../../../patches/acpx@0.13.1.patch", "acpxPatchSha256"]]) {
       expect(createHash("sha256").update(readFileSync(new URL(relative!, import.meta.url))).digest("hex")).toBe(identity.declaration[field!]);
     }
     const manifest = JSON.parse(readFileSync(new URL("../../../acpx-profiles.json", import.meta.url), "utf8"));

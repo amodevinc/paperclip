@@ -1,0 +1,86 @@
+{
+  "schema": "paperclip.copilot.compatibility-revalidation.v1",
+  "recordedAt": "2026-10-20",
+  "status": "pending",
+  "productionReady": false,
+  "profile": 48,
+  "profileDigest": "sha256:49171cb881c43270e101a790a109752642870daedc38cd6e91aef08fd7aab038",
+  "runtimeVersion": "1.0.88",
+  "model": "gpt-5.6-luna",
+  "runtimeSource": null,
+  "baseline": {
+    "profile": 47,
+    "profileDigest": "sha256:55044aa235e88b3fe36ec8a556ee1e3382590870aab907e4462ef7d64af49cea",
+    "record": "2026-10-20-copilot-qualification-v47.json",
+    "identityFixturePreserved": true,
+    "originalResultsAndFailuresPreserved": true,
+    "resultsRegraded": false
+  },
+  "scope": {
+    "kind": "additive-case-contract-compatibility",
+    "changedBindings": [
+      "nativeRuntimeContextSourceSha256",
+      "profileCompatibilitySourceSha256",
+      "semanticCompletionContractSourceSha256",
+      "semanticSchemaBundleSourceSha256",
+      "semanticValidatorsSourceSha256"
+    ],
+    "unchanged": [
+      "Copilot executable and patched distribution",
+      "ACPX patch and permission-policy implementation",
+      "transport, provider process ownership and settlement implementation",
+      "configured model and credentials contract"
+    ],
+    "historicalProfile47": "Decodable for retained runs; not the current launch identity.",
+    "fullProductCampaignRepeated": false,
+    "daytonaRevalidation": "not measured in this change; historical v47 results retain their original identity",
+    "releaseOrDeploymentPerformed": false,
+    "doesNotClaim": "A new 20-cell Product qualification, a new cloud image qualification, or a shipped-release canary."
+  },
+  "offline": {
+    "sourceIdentity": "passed",
+    "typescriptRustGeneratedProfiles": "passed",
+    "protocolGeneratedContracts": "passed",
+    "focusedProfileContinuationAndSchemaTests": {
+      "status": "passed",
+      "files": 5,
+      "tests": 120
+    },
+    "runnerTypecheck": "passed",
+    "imageInputContract": "passed"
+  },
+  "liveProtocol": {
+    "status": "not_run",
+    "automaticRetries": 0,
+    "casesRequired": [
+      "context-before-action",
+      "get-task-context",
+      "create-task-document",
+      "finish-task",
+      "request-human-confirmation",
+      "workflow-context-document-progress",
+      "workflow-governed-wait"
+    ],
+    "results": []
+  },
+  "localProductCanary": {
+    "status": "not_run",
+    "executionId": "extended-harnesses.runner-acpx-copilot.local.file-edit-validate",
+    "automaticRetries": 0,
+    "result": null
+  },
+  "separateCaseFeatureEvidence": {
+    "status": "not_run",
+    "executionId": "case-handoffs.runner-codex.local.receipt-smoke",
+    "expectedTaskWorkRuns": 4,
+    "qualifiesCopilot": false,
+    "result": null
+  },
+  "billing": {
+    "provider": "github",
+    "nativeUsd": null,
+    "includedCreditsAreNotMeasuredUsd": true,
+    "providerCallsForPreparation": 0
+  },
+  "admission": "Profile48 remains explicitly pending until fresh bounded compatibility evidence is recorded. No v47 result is relabeled as v48."
+}
