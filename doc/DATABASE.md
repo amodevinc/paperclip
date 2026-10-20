@@ -319,6 +319,13 @@ Attention counts use the same catalog projection and read only invocation IDs
 and connection IDs to associate pending requests. Summary queries also omit
 review titles and descriptions; the separate review query still returns them.
 
+Internal effective-tool assignment lookups use the same catalog projection.
+Run preparation, native runtime setup, and connection policy checks need tool
+IDs and names, not complete tool definitions. They still resolve current profile
+bindings, selectors, exclusions, and installed connections on every call. The
+public effective-profile response continues to include complete tool schemas
+and annotations.
+
 ## Execution identity row locks
 
 Identity initialization, credential acquisition, and steering reconciliation lock

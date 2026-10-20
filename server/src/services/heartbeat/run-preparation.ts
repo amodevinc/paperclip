@@ -932,7 +932,7 @@ export async function buildPaperclipRuntimeMcpServers(input: {
   expectedAssignmentDigest?: string | null;
 }): Promise<AdapterRuntimeMcpServer[]> {
   const access = toolAccessService(input.db);
-  const effective = await access.getEffectiveProfilesForAgent(
+  const effective = await access.getEffectiveToolAssignmentsForAgent(
     input.agent.companyId,
     input.agent.id,
   );
