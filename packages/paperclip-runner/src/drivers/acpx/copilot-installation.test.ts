@@ -85,10 +85,27 @@ async function withCopilotTestPlatform<T>(arch: "x64" | "arm64", run: () => Prom
 vi.mock("./installation-integrity.js", () => ({ verifyNativeAcpxInstallation: vi.fn() }));
 
 describe("Copilot build-owned installation", () => {
-  it("admits profile48 after bounded case-contract compatibility revalidation", () => {
-    expect(QUALIFIED_ACPX_PROFILES.copilot.agentProfileVersion).toBe(48);
-    expect(QUALIFIED_ACPX_PROFILES.copilot.qualificationStatus).toBeUndefined();
-    expect(QUALIFIED_ACPX_PROFILES.copilot.commandDigest).toBe("sha256:49171cb881c43270e101a790a109752642870daedc38cd6e91aef08fd7aab038");
+  it("holds profile49 for bounded completion-recovery compatibility revalidation", () => {
+    expect(QUALIFIED_ACPX_PROFILES.copilot.agentProfileVersion).toBe(49);
+    expect(QUALIFIED_ACPX_PROFILES.copilot.qualificationStatus).toBe("pending");
+    expect(QUALIFIED_ACPX_PROFILES.copilot.commandDigest).toBe("sha256:37a8f6a540a7417bb12becbf283158df8cca925c5136ecc0db14597441fff702");
+  });
+
+  it("preserves qualified v48 while binding completion-proposal recovery in v49", async () => {
+    const prior = JSON.parse(readFileSync(new URL("../../../test/fixtures/copilot-profile-v48-identity.json", import.meta.url), "utf8"));
+    const current = JSON.parse(readFileSync(new URL("../../../test/fixtures/copilot-profile-v49-identity.json", import.meta.url), "utf8"));
+    expect(prior.commandDigest).toBe("sha256:49171cb881c43270e101a790a109752642870daedc38cd6e91aef08fd7aab038");
+    const sortedPrior = Object.fromEntries(Object.entries(prior.declaration).sort(([a], [b]) => a.localeCompare(b)));
+    expect(`sha256:${createHash("sha256").update(JSON.stringify(sortedPrior)).digest("hex")}`).toBe(prior.commandDigest);
+    expect(Object.keys(current.declaration).sort()).toEqual(Object.keys(prior.declaration).sort());
+    expect(Object.keys(current.declaration).filter(key => current.declaration[key] !== prior.declaration[key]).sort()).toEqual([
+      "agentProfileVersion", "nativeSessionRuntimeSourceSha256", "profileCompatibilitySourceSha256",
+    ]);
+    expect(isSupportedAcpxProfileVersion("copilot", 48)).toBe(true);
+    vi.mocked(verifyNativeAcpxInstallation).mockClear();
+    await expect(verifyCopilotInstallation({ ...QUALIFIED_ACPX_PROFILES.copilot,
+      agentProfileVersion: 48, commandDigest: prior.commandDigest })).rejects.toThrow("exact pinned");
+    expect(verifyNativeAcpxInstallation).not.toHaveBeenCalled();
   });
 
   it("preserves qualified v47 while binding the additive case contracts in v48", async () => {
