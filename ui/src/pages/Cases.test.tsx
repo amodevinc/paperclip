@@ -4,7 +4,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { Link, MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
+import { Link, MemoryRouter, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import type { CaseSummary } from "@/api/cases";
 import { Cases } from "./Cases";
 
@@ -39,7 +39,12 @@ function createCase(overrides: Partial<CaseSummary> = {}): CaseSummary {
 
 function LocationProbe() {
   const location = useLocation();
-  return <output data-testid="location">{location.pathname}{location.search}</output>;
+  const navigate = useNavigate();
+  return <>
+    <output data-testid="location">{location.pathname}{location.search}</output>
+    <button onClick={() => navigate(-1)}>History back</button>
+    <button onClick={() => navigate(1)}>History forward</button>
+  </>;
 }
 function DetailProbe() {
   const location = useLocation();
@@ -172,6 +177,50 @@ describe("Read-only cases list", () => {
     })));
     expect(container.querySelector('[data-testid="location"]')?.textContent).not.toContain("page=");
     expect(casesApi.listTypes).toHaveBeenCalledWith("company-1");
+  });
+
+  it("preserves a newly selected type when search changes before its navigation settles", async () => {
+    await renderPage();
+    await waitFor(() => expect(casesApi.listTypes).toHaveBeenCalled());
+    await click(labelledButton("Filter cases"));
+    await click(document.body.querySelector('[aria-label="Filter by type"]')!);
+    const option = [...document.body.querySelectorAll('[role="option"]')]
+      .find(element => element.textContent === "Bug")!;
+    const input = container.querySelector<HTMLInputElement>('input[aria-label="Search cases"]')!;
+    // Both user changes can precede React Router's next render. URL updates
+    // must compose rather than the later search replacing the selected type.
+    await act(async () => {
+      option.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, "webhook");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await waitFor(() => expect(casesApi.list).toHaveBeenLastCalledWith("company-1", expect.objectContaining({
+      q: "webhook", type: "Bug", offset: 0,
+    })));
+    expect(new URLSearchParams(container.querySelector('[data-testid="location"]')!.textContent!.split("?")[1]).get("type"))
+      .toBe("Bug");
+  });
+
+  it("uses restored URL filters after back and forward navigation", async () => {
+    casesApi.list.mockResolvedValue(Array.from({ length: 51 }, (_, index) => createCase({ id: `case-${index}` })));
+    await renderPage("/PAP/cases?type=Bug");
+    await waitFor(() => expect(button("Next").disabled).toBe(false));
+    await click(button("Next"));
+    await click(labelledButton("Filter cases (1 active)"));
+    await click(document.body.querySelector('[aria-label="Filter by type"]')!);
+    await click([...document.body.querySelectorAll('[role="option"]')].find(element => element.textContent === "Research")!);
+    await escape();
+    await click(button("History back"));
+    for (const [type, query] of [["Bug", "restored back"], ["Research", "restored forward"]]) {
+      await waitFor(() => expect(casesApi.list).toHaveBeenLastCalledWith("company-1", expect.objectContaining({ type })));
+      const input = container.querySelector<HTMLInputElement>('input[aria-label="Search cases"]')!;
+      await act(async () => {
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, query);
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+      });
+      await waitFor(() => expect(casesApi.list).toHaveBeenLastCalledWith("company-1", expect.objectContaining({ type, q: query })));
+      if (type === "Bug") await click(button("History forward"));
+    }
   });
 
   it("keeps cold URL filter selections while filter choices load", async () => {

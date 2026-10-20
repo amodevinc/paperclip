@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useLayoutEffect, useRef } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { FolderOpen, Search } from "lucide-react";
 import { casesApi, CASE_STATUSES, type ListCasesParams } from "@/api/cases";
@@ -42,6 +42,8 @@ export function Cases() {
   const { selectedCompanyId } = useCompany();
   const { setBreadcrumbs } = useBreadcrumbs();
   const [params, setParams] = useSearchParams();
+  const latestParams = useRef(params);
+  useLayoutEffect(() => { latestParams.current = params; }, [params]);
   const query = params.get("q") ?? "";
   const view = caseListView(params);
   const requestedStatus = params.get("status") ?? ALL;
@@ -98,33 +100,35 @@ export function Cases() {
     groups.get(key)!.records.push(record);
   }
 
+  const updateParams = (update: (next: URLSearchParams) => void, replace = false) => {
+    // Router callbacks each receive the last rendered URL, rather than queued
+    // updates. Compose rapid controls against the latest requested URL instead.
+    const next = new URLSearchParams(latestParams.current);
+    update(next);
+    latestParams.current = next;
+    setParams(next, { replace });
+  };
   const setFilter = (key: string, value: string) => {
-    setParams(current => {
-      const next = new URLSearchParams(current);
+    updateParams(next => {
       if (!value || (key !== "q" && value === ALL)) next.delete(key);
       else next.set(key, value);
       next.delete("page");
-      return next;
-    }, { replace: true });
+    }, true);
   };
   const setPage = (nextPage: number) => {
-    setParams(current => {
-      const next = new URLSearchParams(current);
+    updateParams(next => {
       if (nextPage === 1) next.delete("page");
       else next.set("page", String(nextPage));
-      return next;
     });
   };
   const setView = (values: Record<string, string>, resetPage = true) => {
-    setParams(current => {
-      const next = new URLSearchParams(current);
+    updateParams(next => {
       for (const [key, value] of Object.entries(values)) {
         if (!value) next.delete(key);
         else next.set(key, value);
       }
       if (resetPage) next.delete("page");
-      return next;
-    }, { replace: true });
+    }, true);
   };
   const clearFilters = () => setView({ q: "", status: "", type: "", project: "" });
 

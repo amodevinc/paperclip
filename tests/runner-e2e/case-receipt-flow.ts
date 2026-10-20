@@ -271,13 +271,17 @@ async function verifyReceiptBrowser(input: Input, workflowCase: Row, task: Row, 
   await page.getByRole("button", { name: /^Filter cases/ }).click();
   await page.getByLabel("Filter by project", { exact: true }).click();
   await page.getByRole("option", { name: "No project", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Filter by project", exact: true })).toHaveText("No project");
   await page.keyboard.press("Escape");
   await expect(cases().getByRole("link")).toHaveCount(2);
   await page.getByRole("button", { name: "Clear filters", exact: true }).click();
   await page.getByRole("button", { name: /^Filter cases/ }).click();
   await page.getByLabel("Filter by type", { exact: true }).click();
   await page.getByRole("option", { name: "receipt-smoke", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Filter by type", exact: true })).toHaveText("receipt-smoke");
   await page.keyboard.press("Escape");
+  await expect.poll(() => new URL(page.url()).searchParams.get("type")).toBe("receipt-smoke");
+  await expect(cases().getByRole("link")).toHaveCount(1);
   await page.getByRole("textbox", { name: "Search cases" }).fill(nonce);
   await expect(cases().getByRole("link")).toHaveCount(1);
   await cases().getByRole("link", { name: new RegExp(execution.task.buildTitle(nonce)) }).click();

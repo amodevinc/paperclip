@@ -131,8 +131,14 @@ test("browses passive cases and rolled-up task documents without starting work o
   await expect(list.getByRole("link")).toHaveCount(1);
   await expect(list).toContainText("Research done");
   await page.getByRole("button", { name: "Clear filters", exact: true }).click();
-  await choose("type", "receipt");
+  await page.getByRole("button", { name: /^Filter cases/ }).click();
+  await page.getByLabel("Filter by type", { exact: true }).click();
+  await page.getByRole("option", { name: "receipt", exact: true }).click();
+  await page.keyboard.press("Escape");
+  // Edit immediately: a pending type navigation must not be replaced by search.
   await page.getByRole("textbox", { name: "Search cases" }).fill("Pacific");
+  await expect.poll(() => new URL(page.url()).searchParams.get("type")).toBe("receipt");
+  await expect.poll(() => new URL(page.url()).searchParams.get("q")).toBe("Pacific");
   await expect(list.getByRole("link")).toHaveCount(1);
   await expect(casePage.getByRole("status")).toHaveText("1 case");
   const filteredUrl = page.url();
