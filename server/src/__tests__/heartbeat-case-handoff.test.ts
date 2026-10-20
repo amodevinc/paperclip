@@ -1,16 +1,24 @@
 import { randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import { rm } from "node:fs/promises";
+import { hostname } from "node:os";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { and, eq } from "drizzle-orm";
 import { agents, agentWakeupRequests, authUsers, caseEvents, caseHandoffs, cases, companies, companyMemberships,
-  createDb, heartbeatRuns, issueComments, issues } from "@paperclipai/db";
+  createDb, heartbeatRunEvents, heartbeatRuns, issueComments, issues } from "@paperclipai/db";
 import { issueRecoveryActions, issueRelations } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { runningProcesses } from "../adapters/index.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
-import { assertNoCaseHandoffMutation, isCaseHandoffSourceReleased, recordCaseHandoffExecutionReleased } from "../services/heartbeat/case-handoff-lifecycle.js";
+import { assertNoCaseHandoffMutation, isCaseHandoffSourceReleased, recordCaseHandoffExecutionReleased, recordLegacyCaseHandoffCleanupIntent, recordLegacyCaseHandoffCleanupVerified } from "../services/heartbeat/case-handoff-lifecycle.js";
 import { caseHandoffDeliveryService } from "../services/case-handoff-delivery.js";
 import { conflict } from "../errors.js";
+import { prepareHeartbeatRunScratch, cleanupHeartbeatRunScratch } from "../services/run-scratch.js";
+import { appendHeartbeatRunEvent } from "../services/heartbeat-run-events.js";
+import { createAgentIdentityRedactor } from "../services/agent-identity-redaction.js";
+import { createHeartbeatRunOutput } from "../services/heartbeat/run-output.js";
 
 describe("durable case handoff queue admission", () => {
   let temporary: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
@@ -137,6 +145,121 @@ describe("durable case handoff queue admission", () => {
     await caseHandoffDeliveryService(db, { heartbeat: heartbeatService(db), now: () => new Date(at.getTime() + 122_000) }).sweepPending();
     expect((await db.select().from(caseHandoffs).where(eq(caseHandoffs.id, f.handoffId)))[0]?.state).toBe("delivered");
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.wakeupRequestId, f.wakeupRequestId))).toHaveLength(1);
+  });
+  it.each(["after_removal", "before_removal"] as const)("recovers a clean local legacy handoff across a %s crash before the release marker", async crash => {
+    const f = await fixture(), sourceRunId = randomUUID(), controllerBootId = randomUUID();
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });
+    await once(child, "spawn");
+    const processId = child.pid!, processStartedAt = new Date();
+    const scratch = await prepareHeartbeatRunScratch({ companyId: f.companyId, agentId: f.agentId, runId: sourceRunId, issueId: f.issueId });
+    let restartedDb: ReturnType<typeof createDb> | undefined;
+    try {
+      const exited = once(child, "exit");
+      child.kill("SIGTERM");
+      await exited;
+      await db.insert(heartbeatRuns).values({ id: sourceRunId, companyId: f.companyId, agentId: f.agentId,
+        status: "succeeded", runtimeMode: "legacy", startedAt: processStartedAt, finishedAt: new Date(), controllerBootId,
+        processPid: processId, processGroupId: processId, processStartedAt, contextSnapshot: { issueId: f.issueId }, responsibleUserId: f.userId });
+      await db.update(issues).set({ executionRunId: sourceRunId }).where(eq(issues.id, f.issueId));
+      await db.update(caseHandoffs).set({ state: "awaiting_release", sourceRunId, fromAgentId: f.agentId }).where(eq(caseHandoffs.id, f.handoffId));
+      const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, sourceRunId));
+      const output = createHeartbeatRunOutput(db, { run: source, runId: sourceRunId, issueId: f.issueId,
+        runLogStore: { begin: async () => ({ store: "local_file", logRef: "synthetic-legacy-log" }), append: async () => 0 },
+        identityRedactor: createAgentIdentityRedactor(), secretKeys: new Set(), getCurrentUserRedactionOptions: async () => ({ enabled: false }),
+        appendRunEvent: (run, event) => appendHeartbeatRunEvent(db, { companyId: run.companyId, agentId: run.agentId, runId: run.id, ...event }),
+      });
+      const handlers = await output.begin(source);
+      await handlers.onAdapterEvent({ eventType: "legacy.case_handoff_cleanup_verified", stream: "system", payload: {
+        schema: "paperclip.legacy-case-handoff-cleanup.v1", issueId: f.issueId, host: hostname(), controllerBootId,
+        processPid: processId, processGroupId: processId, processStartedAt: processStartedAt.toISOString(), scratch,
+      } });
+      expect(await db.select().from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, sourceRunId),
+        eq(heartbeatRunEvents.eventType, "legacy.case_handoff_cleanup_verified")))).toHaveLength(0);
+      await handlers.onAdapterEvent({ eventType: "adapter.progress", stream: "system", payload: { stage: "finished" } });
+      expect(await db.select().from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, sourceRunId),
+        eq(heartbeatRunEvents.eventType, "adapter.progress")))).toHaveLength(1);
+      expect(await isCaseHandoffSourceReleased(db, { runId: sourceRunId, issueId: f.issueId })).toBe(false);
+      const groupAlive = (group: number | null | undefined) => { try { process.kill(-group!, 0); return true; } catch { return false; } };
+      const cleanup = cleanupHeartbeatRunScratch({ scratch, processGroupId: processId, isProcessGroupAlive: groupAlive,
+        beforeRemove: async () => {
+          await recordLegacyCaseHandoffCleanupVerified(db, { runId: sourceRunId, controllerBootId, scratch });
+          if (crash === "before_removal") throw new Error("Controller crashed before scratch removal");
+        } });
+      if (crash === "before_removal") await expect(cleanup).rejects.toThrow("Controller crashed");
+      else expect(await cleanup).toMatchObject({ removed: true });
+      const [receipt] = await db.select().from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, sourceRunId),
+        eq(heartbeatRunEvents.eventType, "legacy.case_handoff_cleanup_verified")));
+      expect(receipt).toMatchObject({ sourceEventId: null, payload: { issueId: f.issueId, processPid: processId, processGroupId: processId } });
+
+      // Provider-authored evidence and a different process/controller generation
+      // cannot grant release, even if their payload copies the exact receipt.
+      await db.update(heartbeatRunEvents).set({ sourceEventId: "provider-forged-stop" }).where(eq(heartbeatRunEvents.id, receipt.id));
+      expect(await isCaseHandoffSourceReleased(db, { runId: sourceRunId, issueId: f.issueId })).toBe(false);
+      await db.update(heartbeatRunEvents).set({ sourceEventId: null }).where(eq(heartbeatRunEvents.id, receipt.id));
+      await db.update(heartbeatRuns).set({ controllerBootId: randomUUID() }).where(eq(heartbeatRuns.id, sourceRunId));
+      expect(await isCaseHandoffSourceReleased(db, { runId: sourceRunId, issueId: f.issueId })).toBe(false);
+      await db.update(heartbeatRuns).set({ controllerBootId }).where(eq(heartbeatRuns.id, sourceRunId));
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, sourceRunId)))[0]?.resultJson ?? {}).not.toHaveProperty("caseHandoffExecutionReleased");
+
+      restartedDb = createDb(temporary.connectionString);
+      const at = new Date(Date.now() + 61_000);
+      await caseHandoffDeliveryService(restartedDb, { heartbeat: heartbeatService(restartedDb), now: () => at }).sweepPending();
+      expect((await restartedDb.select().from(caseHandoffs).where(eq(caseHandoffs.id, f.handoffId)))[0]?.state).toBe("delivered");
+      expect(await restartedDb.select().from(heartbeatRuns).where(eq(heartbeatRuns.wakeupRequestId, f.wakeupRequestId))).toHaveLength(1);
+      expect((await restartedDb.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, sourceRunId)))[0]?.resultJson)
+        .toHaveProperty("caseHandoffExecutionReleased");
+    } finally {
+      try { process.kill(-processId, "SIGTERM"); } catch { /* already stopped */ }
+      await rm(scratch.dir, { recursive: true, force: true });
+      await restartedDb?.$client.end();
+    }
+  });
+  it.each([true, false])("recovers a legacy crash before cleanup begins with scratch=%s, only after real stop and workspace settlement", async withScratch => {
+    const f = await fixture(), sourceRunId = randomUUID(), controllerBootId = randomUUID(), startedAt = new Date();
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });
+    await once(child, "spawn");
+    const processId = child.pid!;
+    const scratch = withScratch ? await prepareHeartbeatRunScratch({ companyId: f.companyId, agentId: f.agentId,
+      runId: sourceRunId, issueId: f.issueId }) : null;
+    let restartedDb: ReturnType<typeof createDb> | undefined;
+    try {
+      await db.insert(heartbeatRuns).values({ id: sourceRunId, companyId: f.companyId, agentId: f.agentId,
+        status: "running", runtimeMode: "legacy", startedAt, controllerBootId, processPid: processId,
+        processGroupId: processId, processStartedAt: startedAt, contextSnapshot: { issueId: f.issueId }, responsibleUserId: f.userId });
+      // Preparation records intent even before a handoff references this run.
+      await recordLegacyCaseHandoffCleanupIntent(db, { runId: sourceRunId, issueId: f.issueId, controllerBootId, scratch });
+      await db.update(issues).set({ executionRunId: sourceRunId }).where(eq(issues.id, f.issueId));
+      await db.update(caseHandoffs).set({ state: "awaiting_release", sourceRunId, fromAgentId: f.agentId }).where(eq(caseHandoffs.id, f.handoffId));
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, sourceRunId));
+      const at = new Date(Date.now() + 61_000);
+      restartedDb = createDb(temporary.connectionString);
+      await caseHandoffDeliveryService(restartedDb, { heartbeat: heartbeatService(restartedDb), now: () => at }).sweepPending();
+      expect((await db.select().from(caseHandoffs).where(eq(caseHandoffs.id, f.handoffId)))[0]?.state).toBe("awaiting_release");
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wakeupRequestId))).toHaveLength(0);
+      const exited = once(child, "exit"); child.kill("SIGTERM"); await exited;
+
+      const [hold] = await db.insert(issueRecoveryActions).values({ companyId: f.companyId, sourceIssueId: f.issueId,
+        kind: "execution_reconciliation", cause: "uncertain_provider_action", fingerprint: randomUUID(),
+        nextAction: "Confirm workspace settlement", status: "active" }).returning();
+      expect(await isCaseHandoffSourceReleased(restartedDb, { runId: sourceRunId, issueId: f.issueId })).toBe(false);
+      await db.update(issueRecoveryActions).set({ status: "resolved", resolvedAt: new Date() }).where(eq(issueRecoveryActions.id, hold.id));
+      await db.update(heartbeatRuns).set({ controllerLeaseExpiresAt: new Date(Date.now() + 60_000) }).where(eq(heartbeatRuns.id, sourceRunId));
+      expect(await isCaseHandoffSourceReleased(restartedDb, { runId: sourceRunId, issueId: f.issueId })).toBe(false);
+      await db.update(heartbeatRuns).set({ controllerLeaseExpiresAt: null }).where(eq(heartbeatRuns.id, sourceRunId));
+      expect(await db.select().from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, sourceRunId),
+        eq(heartbeatRunEvents.eventType, "legacy.case_handoff_cleanup_verified")))).toHaveLength(0);
+
+      await caseHandoffDeliveryService(restartedDb, { heartbeat: heartbeatService(restartedDb),
+        now: () => new Date(at.getTime() + 61_000) }).sweepPending();
+      expect((await db.select().from(caseHandoffs).where(eq(caseHandoffs.id, f.handoffId)))[0]?.state).toBe("delivered");
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.wakeupRequestId, f.wakeupRequestId))).toHaveLength(1);
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, sourceRunId)))[0]?.resultJson)
+        .toHaveProperty("caseHandoffExecutionReleased");
+    } finally {
+      try { process.kill(-processId, "SIGTERM"); } catch { /* already stopped */ }
+      if (scratch) await rm(scratch.dir, { recursive: true, force: true });
+      await restartedDb?.$client.end();
+    }
   });
   it("admits an authenticated new phase after two case-only runs without treating its agent comment as an idle re-wake", async () => {
     const f = await fixture();

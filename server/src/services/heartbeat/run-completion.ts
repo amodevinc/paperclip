@@ -719,6 +719,15 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     );
 
     const finalizedRun = persistedRun ?? (await getRun(run.id));
+    const settleAgent = () => finalizeAgentStatus(agent.id, outcome, runErrorMessage, {
+      keepIdleOnFailure:
+        outcome === "failed" &&
+        ((finalizedRun
+          ? readHeartbeatRunErrorFamily(finalizedRun) === "provider_quota"
+          : runErrorCode === "provider_quota") ||
+          isWorkspaceSyncConflictFailure(adapterResult.errorMessage)),
+      wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
+    });
     if (finalizedRun) {
       await appendRunEvent(finalizedRun, {
         eventType: "lifecycle",
@@ -757,6 +766,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
         // which can make a same-agent successor eligible immediately.
         await persistSessionState(livenessRun);
         await releaseIssueExecutionAndPromote(livenessRun, { suppressImmediateRecovery: true });
+        await settleAgent();
         return;
       }
       const skipRunIssueComment =
@@ -1030,15 +1040,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     if (finalizedRun) {
       await persistSessionState(finalizedRun);
     }
-    await finalizeAgentStatus(agent.id, outcome, runErrorMessage, {
-      keepIdleOnFailure:
-        outcome === "failed" &&
-        ((finalizedRun
-          ? readHeartbeatRunErrorFamily(finalizedRun) === "provider_quota"
-          : runErrorCode === "provider_quota") ||
-          isWorkspaceSyncConflictFailure(adapterResult.errorMessage)),
-      wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
-    });
+    await settleAgent();
   }
 
   async function failRun(input: FailHeartbeatRunInput) {
@@ -1172,6 +1174,12 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     }
 
     const failedRun = failedRunWrite.run;
+    const settleAgent = () => finalizeAgentStatus(agent.id, "failed", message, {
+      wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
+      keepIdleOnFailure:
+        Boolean(nonRetryablePreflightFailureCode(err)) ||
+        isWorkspaceSyncConflictFailure(message),
+    });
     await setWakeupStatus(run.wakeupRequestId, "failed", {
       finishedAt: new Date(),
       error: message,
@@ -1203,6 +1211,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       await measureRunPhase("completion.summary", () => refreshContinuationSummaryForRun(livenessRun, agent));
       if (await pendingCaseHandoffForRun(db, livenessRun.id, livenessRun.companyId)) {
         await releaseIssueExecutionAndPromote(livenessRun, { suppressImmediateRecovery: true });
+        await settleAgent();
         return;
       }
       if (
@@ -1266,12 +1275,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       }
     }
 
-    await finalizeAgentStatus(agent.id, "failed", message, {
-      wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
-      keepIdleOnFailure:
-        Boolean(nonRetryablePreflightFailureCode(err)) ||
-        isWorkspaceSyncConflictFailure(message),
-    });
+    await settleAgent();
   }
 
   async function failRunSetup(input: FailHeartbeatRunSetupInput) {

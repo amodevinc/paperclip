@@ -1,5 +1,8 @@
-import { and, eq, inArray, sql } from "drizzle-orm";
-import { caseEvents, caseHandoffs, cases, heartbeatRuns, issues, type Db } from "@paperclipai/db";
+import { lstat } from "node:fs/promises";
+import { hostname, tmpdir } from "node:os";
+import path from "node:path";
+import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
+import { caseEvents, caseHandoffs, cases, environmentLeases, heartbeatRunEvents, heartbeatRuns, issues, type Db } from "@paperclipai/db";
 import { persistActivity, type ActivityPublication } from "../activity-log.js";
 import { conflict } from "../../errors.js";
 import { getExecutionBlocker, hasPendingRunCleanup } from "../execution-blocker.js";
@@ -10,6 +13,105 @@ import { DELIVERY_QUEUES, notifyDeliveryWork } from "../delivery-work-notificati
 import { assertActorCanReadCase, assertCaseTrustedForExecution } from "../case-access.js";
 import { assertCaseHandoffSourceAuthority, lockCaseHandoffAuthorityRun } from "../case-handoff-authority.js";
 import type { AuthorizationActor } from "../authorization.js";
+import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
+import { cleanupHeartbeatRunScratch, type HeartbeatRunScratch } from "../run-scratch.js";
+
+const LEGACY_HANDOFF_CLEANUP_VERIFIED = "legacy.case_handoff_cleanup_verified";
+const LEGACY_HANDOFF_CLEANUP_SCHEMA = "paperclip.legacy-case-handoff-cleanup.v1";
+const LEGACY_HANDOFF_CLEANUP_INTENT = "legacy.case_handoff_cleanup_intent";
+
+function localProcessAbsent(pid: number) {
+  try { process.kill(pid, 0); return false; }
+  catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH"; }
+}
+
+/** Host-owned cleanup intent precedes provider dispatch; it claims no stop. */
+export async function recordLegacyCaseHandoffCleanupIntent(db: Db, input: {
+  runId: string; issueId: string; controllerBootId: string; scratch: HeartbeatRunScratch | null;
+}) {
+  await db.transaction(async transaction => {
+    const tx = transaction as unknown as Db;
+    const [run] = await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, input.runId)).for("update");
+    if (!run || run.runtimeMode !== "legacy" || run.status !== "running" || run.controllerBootId !== input.controllerBootId) return;
+    if (input.scratch && (input.scratch.metadata.companyId !== run.companyId || input.scratch.metadata.agentId !== run.agentId ||
+      input.scratch.metadata.runId !== run.id || input.scratch.metadata.issueId !== input.issueId)) return;
+    await appendHeartbeatRunEvent(tx, { companyId: run.companyId, agentId: run.agentId, runId: run.id,
+      eventType: LEGACY_HANDOFF_CLEANUP_INTENT, stream: "system", level: "info",
+      message: "Recorded owned local cleanup before legacy provider dispatch.", payload: {
+        schema: "paperclip.legacy-case-handoff-cleanup-intent.v1", issueId: input.issueId, host: hostname(),
+        controllerBootId: run.controllerBootId, runStartedAt: run.startedAt?.toISOString() ?? null, scratch: input.scratch,
+        processPid: run.processPid, processGroupId: run.processGroupId, processStartedAt: run.processStartedAt?.toISOString() ?? null,
+      } });
+  });
+}
+
+/** Called by scratch cleanup before irreversible removal, never by an adapter. */
+export async function recordLegacyCaseHandoffCleanupVerified(db: Db, input: {
+  runId: string; controllerBootId: string; scratch: HeartbeatRunScratch;
+}) {
+  await db.transaction(async transaction => {
+    const tx = transaction as unknown as Db;
+    const [run] = await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, input.runId)).for("update");
+    if (!run || run.runtimeMode !== "legacy" || run.controllerBootId !== input.controllerBootId ||
+        !["succeeded", "failed", "cancelled", "interrupted", "timed_out"].includes(run.status) ||
+        !run.processPid || !Number.isSafeInteger(run.processPid) || run.processPid <= 1 ||
+        !run.processGroupId || !Number.isSafeInteger(run.processGroupId) || run.processGroupId <= 1 ||
+        !localProcessAbsent(run.processPid) || !localProcessAbsent(-run.processGroupId)) return;
+    const handoff = await pendingCaseHandoffForRun(tx, run.id, run.companyId);
+    const metadata = input.scratch.metadata;
+    if (!handoff || metadata.companyId !== run.companyId || metadata.agentId !== run.agentId ||
+        metadata.runId !== run.id || metadata.issueId !== handoff.issueId) return;
+    const leases = await tx.select({ provider: environmentLeases.provider }).from(environmentLeases)
+      .where(and(eq(environmentLeases.companyId, run.companyId), eq(environmentLeases.heartbeatRunId, run.id)));
+    // Remote PID numbers have no meaning on this host.
+    if (leases.some(lease => lease.provider !== "local")) return;
+    await appendHeartbeatRunEvent(tx, { companyId: run.companyId, agentId: run.agentId, runId: run.id,
+      eventType: LEGACY_HANDOFF_CLEANUP_VERIFIED, stream: "system", level: "info",
+      message: "Verified the owned legacy process stopped before scratch removal.", payload: {
+        schema: LEGACY_HANDOFF_CLEANUP_SCHEMA, issueId: handoff.issueId, host: hostname(),
+        controllerBootId: run.controllerBootId, processPid: run.processPid, processGroupId: run.processGroupId,
+        processStartedAt: run.processStartedAt?.toISOString() ?? null, scratch: input.scratch,
+      } });
+  });
+}
+
+async function recoverLegacyCaseHandoffCleanup(db: Db, run: typeof heartbeatRuns.$inferSelect, issueId: string) {
+  if (run.runtimeMode !== "legacy" || (run.controllerLeaseExpiresAt && run.controllerLeaseExpiresAt > new Date())) return false;
+  const [event] = await db.select({ eventType: heartbeatRunEvents.eventType, payload: heartbeatRunEvents.payload }).from(heartbeatRunEvents).where(and(
+    eq(heartbeatRunEvents.companyId, run.companyId), eq(heartbeatRunEvents.runId, run.id),
+    eq(heartbeatRunEvents.agentId, run.agentId), inArray(heartbeatRunEvents.eventType, [LEGACY_HANDOFF_CLEANUP_VERIFIED, LEGACY_HANDOFF_CLEANUP_INTENT]),
+    eq(heartbeatRunEvents.stream, "system"), isNull(heartbeatRunEvents.sourceEventId),
+  )).orderBy(desc(heartbeatRunEvents.seq)).limit(1);
+  const receipt = event?.payload;
+  const intent = event?.eventType === LEGACY_HANDOFF_CLEANUP_INTENT;
+  const scratch = receipt?.scratch as HeartbeatRunScratch | null | undefined;
+  if (receipt?.schema !== (intent ? "paperclip.legacy-case-handoff-cleanup-intent.v1" : LEGACY_HANDOFF_CLEANUP_SCHEMA) ||
+      receipt.host !== hostname() || receipt.issueId !== issueId ||
+      !run.controllerBootId || receipt.controllerBootId !== run.controllerBootId ||
+      !run.processPid || !Number.isSafeInteger(run.processPid) || run.processPid <= 1 ||
+      !run.processGroupId || !Number.isSafeInteger(run.processGroupId) || run.processGroupId <= 1 ||
+      receipt.processPid !== run.processPid || receipt.processGroupId !== run.processGroupId ||
+      receipt.processStartedAt !== (run.processStartedAt?.toISOString() ?? null)) return false;
+  if (intent) {
+    if (receipt.runStartedAt !== (run.startedAt?.toISOString() ?? null) ||
+        !localProcessAbsent(run.processPid) || !localProcessAbsent(-run.processGroupId)) return false;
+    const leases = await db.select({ provider: environmentLeases.provider }).from(environmentLeases)
+      .where(and(eq(environmentLeases.companyId, run.companyId), eq(environmentLeases.heartbeatRunId, run.id)));
+    if (leases.some(lease => lease.provider !== "local")) return false;
+    if (scratch === null) return true;
+  }
+  if (typeof scratch?.dir !== "string" || scratch.metadata?.companyId !== run.companyId ||
+      scratch.metadata.agentId !== run.agentId || scratch.metadata.runId !== run.id || scratch.metadata.issueId !== issueId) return false;
+  const relative = path.relative(path.resolve(tmpdir()), path.resolve(scratch.dir));
+  if (relative.startsWith("..") || path.isAbsolute(relative) || !path.basename(scratch.dir).startsWith("paperclip-run-")) return false;
+  try { await lstat(scratch.dir); }
+  catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT"; }
+  // A crash immediately before removal can safely retry the same marked
+  // directory. A live/reused process group or changed ownership stays held.
+  const result = await cleanupHeartbeatRunScratch({ scratch, processGroupId: run.processGroupId,
+    isProcessGroupAlive: group => !localProcessAbsent(-group!) });
+  return result.removed;
+}
 
 /** Kept independent of the handoff application service to avoid an issues/service cycle. */
 export async function pendingCaseHandoffForRun(db: Db, runId: string, companyId?: string) {
@@ -157,6 +259,7 @@ export async function isCaseHandoffSourceReleased(db: Db, input: { runId: string
   const stopped = await remoteExecutionHasStopped(db, run.companyId, run.id) ||
     (run.runtimeMode === "native" && await hasNativeLocalProcessStop(db, run.companyId, run.id)) ||
     neverStarted ||
+    await recoverLegacyCaseHandoffCleanup(db, run, input.issueId) ||
     (run.runtimeMode === "legacy" && recovery?.providerStopped === true && recovery?.sessionPreserved === true &&
       recovery?.actionOutcomes === "settled" && run.executionStage === "settled");
   if (!stopped) return false;

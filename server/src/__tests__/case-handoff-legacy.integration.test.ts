@@ -2,9 +2,9 @@ import { randomUUID } from "node:crypto";
 import type { Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import express from "express";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { agentWakeupRequests, agents, authUsers, caseHandoffs, companies, companyMemberships, createDb, heartbeatRuns, issues } from "@paperclipai/db";
+import { agentWakeupRequests, agents, authUsers, caseHandoffs, companies, companyMemberships, createDb, heartbeatRunEvents, heartbeatRuns, issues } from "@paperclipai/db";
 import { actorMiddleware } from "../middleware/auth.js";
 import { errorHandler } from "../middleware/error-handler.js";
 import { caseRoutes } from "../routes/cases.js";
@@ -120,6 +120,12 @@ describe("case handoff through actual legacy process and HTTP boundaries", () =>
     };
     await waitUntil(() => Boolean(accepted && releaseSource), "source did not call the production handoff API");
     expect(accepted!.receipt).toMatchObject({ taskId: initial.taskId, state: "awaiting_release" });
+    const [outgoing] = await db.select().from(caseHandoffs).where(eq(caseHandoffs.id, accepted!.receipt.handoffId));
+    const [sourceRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, outgoing.sourceRunId!));
+    const intents = await db.select().from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, sourceRun.id),
+      eq(heartbeatRunEvents.eventType, "legacy.case_handoff_cleanup_intent")));
+    expect(intents.at(-1)).toMatchObject({ sourceEventId: null, payload: { controllerBootId: sourceRun.controllerBootId,
+      processPid: accepted!.pid, processGroupId: sourceRun.processGroupId, processStartedAt: sourceRun.processStartedAt!.toISOString() } });
     process.kill(accepted!.pid, 0); // prove the provider process is still alive
     await delivery.sweepPending();
     expect(observed).toBeUndefined();
@@ -131,6 +137,12 @@ describe("case handoff through actual legacy process and HTTP boundaries", () =>
     const releasedIntent = (await db.select().from(caseHandoffs).where(eq(caseHandoffs.id, accepted!.receipt.handoffId)))[0]!;
     expect(releasedIntent.nextAttemptAt.getTime()).toBeLessThanOrEqual(Date.now());
     expect(releasedIntent.leaseExpiresAt).toBeNull();
+    // Retain only the process-bound preparation intent, as a controller crash
+    // before cleanup's later verified receipt/final marker would do.
+    await db.delete(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, sourceRun.id),
+      eq(heartbeatRunEvents.eventType, "legacy.case_handoff_cleanup_verified")));
+    await db.update(heartbeatRuns).set({ resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) - 'caseHandoffExecutionReleased'` })
+      .where(eq(heartbeatRuns.id, sourceRun.id));
     await caseHandoffDeliveryService(db, { heartbeat }).sweepPending();
     await waitUntil(() => Boolean(observed), "successor did not execute");
     await heartbeat.drainActiveRunExecutions();
