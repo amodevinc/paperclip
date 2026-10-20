@@ -102,11 +102,13 @@ export async function runCaseHandoffsFlow(input: {
     const failed = checks?.filter(check => !check.passed) ?? [];
     if (!checks?.length || failed.length) throw new Error(`Case handoff oracle failed: ${failed.map(check => check.id).join(", ") || "missing evidence"}`);
     await page.reload();
-    const workflow = page.getByRole("region", { name: "Case workflow" });
-    await expect(workflow).toBeVisible();
-    await expect(workflow.getByText("revision", { exact: true })).toBeVisible();
-    await workflow.getByText("Handoff history", { exact: true }).click();
-    await expect(workflow.getByText(/verification/).first()).toBeVisible();
+    const work = page.getByRole("region", { name: "Case work", exact: true });
+    await expect(work).toBeVisible();
+    await expect(work.getByText("revision", { exact: true })).toBeVisible();
+    const history = page.getByRole("region", { name: "Case handoffs", exact: true });
+    await expect(history.locator(":scope > ol > li")).toHaveCount(4);
+    await history.locator("summary").filter({ has: page.getByText("verification", { exact: true }) }).click();
+    await expect(history).toContainText("verification");
     await input.capture("case-final", "Persistent case and handoff history after verification", "case-final.png");
     await page.goto(`/${encodeURIComponent(fixtures.company.issuePrefix!)}/issues/${encodeURIComponent(issue!.identifier ?? issue!.id)}`);
     await expect(page.getByTestId("issue-detail-header").getByRole("button", { name: "Change status (current: Done)", exact: true })).toBeVisible();

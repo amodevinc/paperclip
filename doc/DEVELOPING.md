@@ -26,7 +26,7 @@ Recommend both a Mermaid `stateDiagram-v2` map and prose defining each transitio
 trigger, evidence, next agent, human wait/resume behavior and correction/escalation
 limits. State IDs match phase names and prose defines named edge outcomes.
 This guidance adds no server-enforced transition semantics. There is
-there is no passive creation branch or `createOnly` REST extension. Historical
+no passive creation branch or `createOnly` REST extension. Historical
 generic REST upsert semantics remain compatible. `initialDocuments` is valid only for
 new first-task kickoff; ordinary task documents and audit are committed before
 delivery. Case detail/context roll up authorized task document metadata through
@@ -37,6 +37,9 @@ Keep native schemas aligned with their services/routes. Transactional source
 run checks must precede case writes, so Stop or an accepted handoff cannot race
 an HTTP request into a late mutation. Generic API rollout settings do not remove
 these dedicated tools; case, mode and resource authorization still apply.
+Company deletion removes cases before task/agent dependencies. Individual agent
+purge preserves handoff attribution and returns `agent_case_history_retained`
+before destructive cleanup when history references that agent. Termination stays available.
 
 The native constructor preserves full case context for bootstrap and resume
 failure. Compatible continuations carry a versioned case projection tied to the

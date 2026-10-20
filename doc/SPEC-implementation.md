@@ -146,6 +146,9 @@ provider termination and workspace/session settlement are proven. Its late
 mutations cannot complete transferred work. Delivery uses the ordinary wake queue
 with a stable receipt, preserving Stop, private access, responsible-user, pause,
 and budget rules. A queued receipt is not proof that the recipient ran.
+Whole-company deletion removes cases and their history before tasks and agents.
+Permanent deletion of an individual agent with retained handoff history returns
+`409 agent_case_history_retained`; keep that agent terminated to preserve attribution.
 
 An existing case with a primary task may instead receive `to: "done"`.
 This terminal handoff records `awaiting_completion`, keeps assignment and

@@ -140,6 +140,7 @@ API: `present` — representative operation IDs:
 - `POST /api/agents/{id}/pause`.
 - `POST /api/agents/{id}/resume`.
 - `POST /api/agents/{id}/terminate`.
+- `DELETE /api/agents/{id}` permanently purges an eligible terminated/rejected agent.
 - `POST /api/agents/{id}/lifecycle/retry`.
 - `GET /api/agents/{id}` returns the safe failed phase/step and action in `lifecycleError`.
 
@@ -148,6 +149,8 @@ change-grant authorization; pause and termination remain board-only.
 
 Policy: Agent creation/configuration uses action grants, resource policies and change
 consent; some controls require a board actor.
+Permanent deletion is board-only. Retained case handoff references return
+`409 agent_case_history_retained` before dependency cleanup; keep the agent terminated.
 
 Evidence: `source-only` — [implementation](../../server/src/routes/agents.ts#L1395) at
 the reviewed commit above.
