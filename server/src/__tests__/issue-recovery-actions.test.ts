@@ -703,28 +703,32 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 
-  it("preserves an accepted case handoff even when task assignment and status versions are unchanged", async () => {
+  it.each(["awaiting_release", "pending_dispatch"] as const)("preserves an accepted %s agent transfer at both recovery boundaries", async state => {
     const { companyId, coderId, managerId, sourceIssue } = await seedCompany();
     await instanceSettingsService(db).updateExperimental({ enableCases: true });
-    const runId = randomUUID();
-    await seedHeartbeatRun({ companyId, agentId: coderId, runId, issueId: sourceIssue.id, status: "failed" });
-    const [observed] = await db.update(issues).set({ executionRunId: runId, checkoutRunId: runId })
-      .where(eq(issues.id, sourceIssue.id)).returning();
+    if (state === "awaiting_release") {
+      const runId = randomUUID();
+      await seedHeartbeatRun({ companyId, agentId: coderId, runId, issueId: sourceIssue.id, status: "failed" });
+      await db.update(issues).set({ executionRunId: runId, checkoutRunId: runId })
+        .where(eq(issues.id, sourceIssue.id));
+    }
+    const [observed] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
     await db.update(agents).set({ status: "paused" }).where(eq(agents.id, coderId));
+    const toAgentId = state === "awaiting_release" ? managerId : coderId;
     const receipt = await caseHandoffService(db).handoff(companyId,
       { type: "board", source: "local_implicit" }, {
         idempotencyKey: randomUUID(),
         case: { create: { caseType: "work", title: "Continue accepted work" } },
         bindIssueId: observed!.id,
         expectedIssueStatusVersion: observed!.statusVersion,
-        toAgentId: managerId,
+        toAgentId,
         phase: "verification",
         instructions: "Verify the saved work after the source execution settles.",
         workflow_document_text: "Implementation → verification → done.",
       });
-    expect(receipt.state).toBe("awaiting_release");
+    expect(receipt.state).toBe(state);
     const [pending] = await db.select().from(issues).where(eq(issues.id, observed!.id));
-    expect(pending).toMatchObject({
+    if (state === "awaiting_release") expect(pending).toMatchObject({
       status: observed!.status,
       statusVersion: observed!.statusVersion,
       lastStatusDecisionId: observed!.lastStatusDecisionId,
@@ -732,6 +736,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       executionRunId: observed!.executionRunId,
       checkoutRunId: observed!.checkoutRunId,
     });
+    else expect(pending).toMatchObject({ status: "todo", assigneeAgentId: coderId });
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, pending!.id));
     const activities = await db.select().from(activityLog).where(eq(activityLog.companyId, companyId)).orderBy(activityLog.id);
     const enqueueWakeup = vi.fn(async () => null);
@@ -739,13 +744,13 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     // A fresh issue snapshot alone cannot identify the ledger's successor.
     // The locked mutation boundary must consult the accepted handoff too.
     expect(await recovery.escalateStrandedAssignedIssue({
-      issue: pending!, previousStatus: "in_progress", latestRun: null,
+      issue: pending!, previousStatus: state === "awaiting_release" ? "in_progress" : "todo", latestRun: null,
       comment: "The original assignee is not invokable.",
     })).toBeNull();
     expect(await recovery.reconcileStrandedAssignedIssues()).toMatchObject({ escalated: 0, issueIds: [] });
     expect(await db.select().from(issues).where(eq(issues.id, pending!.id))).toEqual([pending]);
     expect(await db.select().from(caseHandoffs).where(eq(caseHandoffs.id, receipt.handoffId)))
-      .toMatchObject([{ state: "awaiting_release", toAgentId: managerId }]);
+      .toMatchObject([{ state, toAgentId }]);
     expect(await db.select().from(issueComments).where(eq(issueComments.issueId, pending!.id))).toEqual(comments);
     expect(await db.select().from(activityLog).where(eq(activityLog.companyId, companyId)).orderBy(activityLog.id)).toEqual(activities);
     expect(await db.select().from(issueRecoveryActions)).toEqual([]);

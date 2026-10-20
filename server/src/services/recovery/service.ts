@@ -4019,11 +4019,13 @@ export function recoveryService(
 
       // Acceptance holds the same issue lock before writing its successor.
       // An awaiting-release handoff need not change the issue's version or
-      // owner, and generic recovery must not cancel that durable intent.
+      // owner, and generic recovery must not cancel that durable successor.
+      // Terminal intent has no successor; ordinary task recovery still owns it.
       const pendingHandoff = await tx.select({ id: caseHandoffs.id }).from(caseHandoffs).where(and(
         eq(caseHandoffs.companyId, current.companyId),
         eq(caseHandoffs.issueId, current.id),
-        inArray(caseHandoffs.state, ["awaiting_release", "pending_dispatch", "awaiting_completion"]),
+        eq(caseHandoffs.destinationKind, "agent"),
+        inArray(caseHandoffs.state, ["awaiting_release", "pending_dispatch"]),
       )).limit(1).then((rows) => rows[0] ?? null);
       if (pendingHandoff) return null;
 
@@ -4488,7 +4490,8 @@ export function recoveryService(
           notExists(db.select({ id: caseHandoffs.id }).from(caseHandoffs).where(and(
             eq(caseHandoffs.companyId, issues.companyId),
             eq(caseHandoffs.issueId, issues.id),
-            inArray(caseHandoffs.state, ["awaiting_release", "pending_dispatch", "awaiting_completion"]),
+            eq(caseHandoffs.destinationKind, "agent"),
+            inArray(caseHandoffs.state, ["awaiting_release", "pending_dispatch"]),
           ))),
         ),
       );

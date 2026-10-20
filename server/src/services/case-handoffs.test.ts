@@ -19,6 +19,7 @@ import { nativeRuntimeContextFixture } from "./native-runtime/runtime-context.te
 import { buildLowTrustSourceTrust } from "./source-trust.js";
 import { issueService } from "./issues.js";
 import { documentService } from "./documents.js";
+import { recoveryService } from "./recovery/service.js";
 
 describe("durable same-task case handoffs", () => {
   let temporary: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
@@ -626,6 +627,55 @@ describe("durable same-task case handoffs", () => {
     expect(await db.select().from(issues).where(eq(issues.companyId, f.companyId))).toHaveLength(1);
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).toHaveLength(1);
   });
+
+  it.each(["sweep", "locked_escalation"] as const)(
+    "retains ordinary %s recovery after a terminal-intent source crashes before task completion",
+    async mode => {
+      const f = await terminalFixture();
+      const receipt = await f.service.handoff(f.companyId, f.actor, f.input);
+      expect(receipt).toMatchObject({ state: "awaiting_completion", callerMustYield: false });
+      // The source stopped before completing the ordinary task. A terminal
+      // intent owns no successor run: paused-owner recovery must stay visible.
+      const [failedRun] = await db.update(heartbeatRuns).set({
+        status: "failed", errorCode: "process_lost", error: "Source crashed after recording terminal intent",
+        finishedAt: new Date(),
+      }).where(eq(heartbeatRuns.id, f.runId)).returning();
+      await db.update(agents).set({ status: "paused" }).where(eq(agents.id, f.engineer));
+      const [observed] = await db.select().from(issues).where(eq(issues.id, f.first.taskId));
+      const enqueueWakeup = vi.fn(async () => null);
+      const recovery = recoveryService(db, { enqueueWakeup });
+      if (mode === "sweep") {
+        expect(await recovery.reconcileStrandedAssignedIssues())
+          .toMatchObject({ escalated: 1, issueIds: [f.first.taskId] });
+      } else {
+        expect(await recovery.escalateStrandedAssignedIssue({
+          issue: observed!, previousStatus: "in_progress", latestRun: failedRun!,
+          comment: "The source stopped before the task completed and its assignee is paused.",
+        })).toMatchObject({ id: f.first.taskId, status: "blocked" });
+      }
+      expect((await db.select().from(issues).where(eq(issues.id, f.first.taskId)))[0])
+        .toMatchObject({ status: "blocked", assigneeAgentId: f.engineer, completedAt: null });
+      expect((await db.select().from(cases).where(eq(cases.id, f.first.caseId)))[0])
+        .toMatchObject({ status: "draft", completedAt: null });
+      expect((await db.select().from(caseHandoffs).where(eq(caseHandoffs.id, receipt.handoffId)))[0])
+        .toMatchObject({ state: "awaiting_completion", destinationKind: "done", completedAt: null });
+      expect(await db.select().from(issues).where(eq(issues.companyId, f.companyId))).toHaveLength(1);
+      expect(enqueueWakeup).not.toHaveBeenCalled();
+      expect(f.q.wakeup).toHaveBeenCalledTimes(1);
+
+      // Existing task controls resolve the visible hold. The original intent
+      // closes the same case only when ordinary task completion is accepted.
+      await db.update(agents).set({ status: "active" }).where(eq(agents.id, f.engineer));
+      await issueService(db).update(f.first.taskId, { status: "done" });
+      expect((await db.select().from(issues).where(eq(issues.id, f.first.taskId)))[0])
+        .toMatchObject({ id: f.first.taskId, status: "done" });
+      expect((await db.select().from(cases).where(eq(cases.id, f.first.caseId)))[0])
+        .toMatchObject({ status: "done", phase: "done", completedAt: expect.any(Date) });
+      expect((await db.select().from(caseHandoffs).where(eq(caseHandoffs.id, receipt.handoffId)))[0])
+        .toMatchObject({ state: "completed", completedAt: expect.any(Date) });
+      expect(f.q.wakeup).toHaveBeenCalledTimes(1);
+    },
+  );
 
   it("commits task and terminal case completion atomically through the ordinary issue service", async () => {
     const f = await terminalFixture(), receipt = await f.service.handoff(f.companyId, f.actor, f.input);
